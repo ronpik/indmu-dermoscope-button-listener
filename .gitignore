@@ -1,0 +1,117 @@
+# =============================================================================
+# Investigation folder - may contain sensitive data (device captures, PHI,
+# credentials, USB traces, patient-adjacent logs, etc.)
+# Only Markdown notes inside this tree are committed; everything else is ignored.
+# =============================================================================
+dermoscope_investigation/**
+!dermoscope_investigation/
+!dermoscope_investigation/**/
+!dermoscope_investigation/**/*.md
+
+# =============================================================================
+# macOS
+# =============================================================================
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# =============================================================================
+# Windows
+# =============================================================================
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# =============================================================================
+# Editors / IDEs
+# =============================================================================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# =============================================================================
+# Go (dermoscope-helper/)
+# =============================================================================
+# Build output
+dermoscope-helper/dist/
+dist/
+
+# Compiled binaries and platform-specific executables
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go tooling
+vendor/
+go.work
+go.work.sum
+
+# Coverage
+coverage.out
+coverage.html
+*.cover
+
+# =============================================================================
+# Python (prototype helpers + investigation venv)
+# =============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+*/dermoscope_env/
+
+# =============================================================================
+# Logs and runtime artifacts
+# =============================================================================
+*.log
+logs/
+dermoscope-helper.log
+
+# =============================================================================
+# Secrets / environment / credentials
+# =============================================================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+credentials.json
+secrets.json
+
+# =============================================================================
+# USB / device capture artifacts (often generated during investigation)
+# =============================================================================
+*.pcap
+*.pcapng
+*.usbmon
+
+# =============================================================================
+# Archives (typically build outputs, not source)
+# =============================================================================
+*.zip
+*.tar
+*.tar.gz
+*.tgz
