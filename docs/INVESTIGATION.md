@@ -354,9 +354,9 @@ To recover multi-click while keeping capture quality high, we split the two conc
 
 The keystroke contract also changed: we no longer send `F9/F10/F11`. The helper now sends **N consecutive `F9` keystrokes** (~40 ms apart, clamped at 3) and the web app counts F9s within a short window to dispatch the action. Rationale: `F10` activates the window menu bar and `F11` toggles fullscreen — both fight with the browser.
 
-### Where this leaves us
+### Where this left us (and the follow-up session's resolution)
 
-Single-click capture is reliable. Double and triple click are still not reliable — even at 320×240 still-pin resolution, with the current architecture the grouper rarely sees `q≥2`. The "which upstream is absorbing the 2nd/3rd clicks" question is still open; see [`docs/NEXT-SESSION.md`](NEXT-SESSION.md) for the current hypotheses and the next experiments to try.
+Single-click capture is reliable. Double and triple click are **not** reliable and cannot be made reliable on this device — the follow-up session empirically found that any Capture-pin resolution above 320×240 places the UVC driver in a high-bandwidth USB alt-setting that crowds out Still-pin deliveries, dropping clicks 2/3 of rapid bursts. 320×240 works but is too low-resolution for dermoscopy captures. The full per-experiment post-mortem (resolution binary-search 320 → 1600, 352×288 intermediate, forced-fps override, SampleGrabber removal diagnostic) is in [`docs/NEXT-SESSION.md`](NEXT-SESSION.md). The decision was **Option B**: ship single-click only at 1600×1200, move clear/undo/navigate gestures into the web-app UI.
 
 ## 11. Final solution (Windows path)
 
@@ -365,7 +365,7 @@ For TrichoAI on Windows with this device, the architecture is:
 1. **`helper.exe` runs as a local foreground app on the clinician's machine.** It owns the dermoscope camera via DirectShow with an asymmetric two-pin setup: **Capture pin at 1600×1200** (live preview + source of capture snapshots), **Still pin at 320×240** (hardware-button trigger only; its bytes are discarded).
 2. **The web app fetches video from `http://localhost:8080/preview`** as a `multipart/x-mixed-replace` MJPEG stream — drop-in replacement for `<video>` + `getUserMedia`.
 3. **On single button press**, the helper snapshots the current preview frame into `/still` and sends one `F9` keystroke. The web app receives F9 and `fetch('/still')` to render the full-res capture.
-4. **Multi-click** (double/triple) is mechanically supported — the helper counts stills, clamps at 3, sends N F9 keystrokes 40 ms apart, and the web app counts them in a short window to dispatch single/double/triple actions. **Not yet reliable** (see §10 and [`docs/NEXT-SESSION.md`](NEXT-SESSION.md)); production UX should treat single-click as the only reliable gesture and move clear/undo/navigate to in-app controls.
+4. **Multi-click is out of scope.** Investigation in the follow-up session (see §10 and [`docs/NEXT-SESSION.md`](NEXT-SESSION.md)) concluded that rapid double/triple clicks cannot be reliably detected on this device at any capture-quality resolution — the UVC driver's USB alt-setting threshold sits right above 320×240 and crowds out Still-pin deliveries. Production UX treats single-click as the only gesture; clear/undo/navigate live in the web app UI.
 5. **Linux/macOS paths can keep the original gousb design** (different OS-level driver semantics; not addressed in this session).
 
 The reverse-engineering effort was load-bearing: it produced two facts that nothing else in our search uncovered, and which the README/DESIGN docs got wrong.
@@ -380,7 +380,7 @@ The reverse-engineering effort was load-bearing: it produced two facts that noth
 - **Refactor of the Go helper** — left as-is; this session produced the design, not the integration.
 - **Service / tray packaging** of the C++ helper — the MVP is a console exe.
 - **HTTPS / auth** on the local HTTP server — fine for `localhost` MVP, not for production.
-- **Multi-click final tuning** — pending the empirical retest above.
+- **Multi-click final tuning** — resolved, dropped by design (Option B). See §10 and [`docs/NEXT-SESSION.md`](NEXT-SESSION.md).
 - **Camera teardown / restart on device disconnect** — graph is built once at startup.
 - **Multi-camera selection** — first match on substring `vid_ab02` is used.
 - **macOS / Linux equivalents** of approach C — DirectShow is Windows-only; would need Media Foundation, V4L2, or AVFoundation analogs.

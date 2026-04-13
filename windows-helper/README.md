@@ -25,7 +25,7 @@ This is the **working Windows path** produced by the investigation documented in
                                             ┌───────────▼───────────┐
                                             │  Browser / web app    │
                                             │  <img src="/preview"> │
-                                            │  F9/F10/F11 keydown   │
+                                            │  F9 keydown           │
                                             │  fetch('/still')      │
                                             └───────────────────────┘
                                                         ▲
@@ -34,8 +34,8 @@ This is the **working Windows path** produced by the investigation documented in
 ```
 
 - **Live preview** streams at the device's highest MJPEG resolution (1600×1200) from the UVC Capture pin.
-- **Still capture** on button press: we snapshot the most recent preview frame into a dedicated buffer — that's what `GET /still` serves. Captures match the preview quality (1600×1200). The Still-pin stream is used *only* as the hardware trigger; its own bytes are discarded (small still samples, so the device's firmware cooldown is short and rapid clicks can be detected).
-- **Keystrokes** via `SendInput` to the focused window. Helper buffers the click burst, counts, clamps to 3, and emits that many **F9** keystrokes in quick succession (~40 ms apart). The web app counts F9s within a short window and dispatches single / double / triple actions.
+- **Still capture** on button press: we snapshot the most recent preview frame into a dedicated buffer — that's what `GET /still` serves. Captures match the preview quality (1600×1200). The Still-pin stream is used *only* as the hardware trigger; its own bytes are discarded.
+- **Keystroke** via `SendInput` to the focused window: one **F9** per button press. The web app treats every F9 as "capture". Multi-click gestures (clear / undo / etc.) are not reliable on this hardware — see "Known issues" below and [`../docs/NEXT-SESSION.md`](../docs/NEXT-SESSION.md) for the full post-mortem. Put those gestures in the web app's own UI.
 
 ---
 
@@ -92,23 +92,17 @@ Microsoft deprecated `qedit.dll` long ago but it still ships with Windows 10 and
 ## Runtime usage
 
 ```
-helper.exe [port] [debounce_ms] [group_ms]
+helper.exe [port] [debounce_ms]
 ```
 
 | Arg | Default | What it does |
 |---|---|---|
 | `port` | `8080` | TCP port for the local HTTP server (bound to `127.0.0.1`). |
-| `debounce_ms` | `150` | Suppresses still frames arriving within this window of the previous accepted one (anti-bounce). Real clicks that arrive within `debounce_ms` are **dropped**; keep it well under 500 ms. |
-| `group_ms` | `800` | After the most recent accepted still, wait this long for more before deciding the click burst is over. Must exceed the device's inter-still throttle (observed ~515 ms when multi-click was working at low still-pin resolution). Trade-off: also the latency between the last click and the keystroke firing. **Note:** this setting is moot until the multi-click-not-detected bug is resolved — see "Known issues". |
-
-Example: tolerate a wider multi-click window at the cost of a bit more latency:
-```
-helper.exe 8080 150 1200
-```
+| `debounce_ms` | `300` | Suppresses still frames arriving within this window of the previous accepted one. Defense-in-depth only — the device's firmware cooldown between stills is much longer than this anyway. |
 
 ### Log output
 
-The helper prints to **stderr**. Every still that arrives is logged with a `+Xms` gap and an accepted-or-debounced status; every click-pattern decision (`n=1/2/3 → F9/F10/F11`) is logged. Useful for tuning and diagnosing.
+The helper prints to **stderr**. Every accepted still is logged with byte size and "sending F9"; debounced triggers are logged with a `DEBOUNCED` tag.
 
 ---
 
@@ -132,7 +126,7 @@ Response headers include `Access-Control-Allow-Origin: *` so the endpoint can be
 
 Returns the **most recent full-resolution JPEG** snapshot — a copy of the preview frame that was live at the moment the user pressed the hardware button. Content type is `image/jpeg`. Resolution matches the preview (1600×1200 unless you've edited the source). If no button has been pressed yet, returns `404`.
 
-Implementation note: this is *not* a still-pin frame — DirectShow's Still pin on this device is used only as the click trigger, and keeping it at low resolution is what makes rapid multi-click detection possible. For capture quality we snapshot the high-res preview-pin frame at trigger time and serve that.
+Implementation note: this is *not* a still-pin frame — DirectShow's Still pin on this device is used only as the click trigger and kept at 320×240 (its bytes are discarded). For capture quality we snapshot the high-res preview-pin frame at trigger time and serve that.
 
 ```js
 // After receiving F9 (button-click-driven):
@@ -149,26 +143,18 @@ Response includes `Access-Control-Allow-Origin: *`.
 
 Minimal HTML test page that:
 - Renders `<img src="/preview">` live
-- Listens for F9/F10/F11 and handles capture/no-op/clear
-- Fetches `/still` on F9 to render the full-res JPEG into a canvas
+- Listens for F9 and fetches `/still` to draw the full-res JPEG into a canvas
+- Has a "Clear" button to wipe the canvas
 
 Useful as a reference implementation and as a smoke test.
 
-### Keystrokes (not HTTP, but part of the contract)
+### Keystroke (not HTTP, but part of the contract)
 
-The helper waits for the button-click burst to finish (default `group_ms` = 800 ms of silence after the last click), counts the presses, **clamps at 3** (4+ presses are treated as 3), and sends **that many `F9` keystrokes** into the focused window via `SendInput`, spaced ~40 ms apart.
+On each accepted button press, the helper sends **one `F9`** keystroke into the focused window via `SendInput`. That's the whole contract.
 
-| Click pattern | Keystroke(s) sent | Intended web-app behavior |
-|---|---|---|
-| Single click | `F9` once | Capture → fetch `/still` |
-| Double click | `F9 F9` (~40 ms apart) | No-op (preserve last capture) |
-| Triple click (or more) | `F9 F9 F9` (~80 ms total) | Clear last capture |
+**Why F9** (and not F10/F11): both `F10` and `F11` have meaningful Windows behaviors (`F10` activates the window menu bar; `F11` toggles browser fullscreen). Sending them would fight with the browser. F9 is unused by default in most apps.
 
-**Why only F9 and not F10/F11:** both `F10` and `F11` have meaningful Windows behaviors (`F10` activates the window menu bar; `F11` toggles browser fullscreen). Sending them would fight with the browser. A single key with sequence counting is cleaner, and that's what your web app already handles.
-
-**Web-app expectation:** buffer `F9` keydown events and dispatch after a short quiet window (~300–500 ms). See the `<script>` block served at `GET /` for a working example (`F9_WINDOW_MS = 400`).
-
-The keys only arrive at the window that has focus. For this to work, the browser tab using the dermoscope must be focused when the user presses the button.
+**Web-app expectation:** listen for F9 `keydown` and `fetch('/still')`. No sequence buffering, no timers. The keys only arrive at the window that has focus — for this to work, the browser tab using the dermoscope must be focused when the user presses the button.
 
 ---
 
@@ -182,39 +168,21 @@ Minimum integration — add two things to the web app that currently uses `getUs
    ```
    Native resolution is 1600×1200; apply CSS for display size. If the preview looks laggy on a slow USB bus, you can drop the preview resolution by editing `configure_format(..., &PIN_CATEGORY_CAPTURE, 9999, 9999)` in `helper.cpp` — e.g. pass `1024, 768` — and rebuild.
 
-2. **Buffer F9 keydowns and dispatch on count.** The helper sends 1, 2, or 3 F9s in quick succession (~40 ms apart) based on click count. Your handler counts them within a short window and picks the action:
+2. **Listen for F9 keydown and fetch `/still`.** One F9 per button press.
    ```js
-   const F9_WINDOW_MS = 400;
-   let f9Count = 0;
-   let f9Timer = null;
-
-   async function dispatch() {
-     const n = Math.min(f9Count, 3);
-     f9Count = 0;
-     if (n === 1) {
-       const resp = await fetch('http://localhost:8080/still', { cache: 'no-store' });
-       if (resp.ok) {
-         const blob = await resp.blob();
-         // ...render or upload the blob...
-       }
-     } else if (n === 2) {
-       // double-click action (e.g. no-op / keep previous capture)
-     } else if (n >= 3) {
-       // triple-click action (e.g. clear)
-     }
-   }
-
-   document.addEventListener('keydown', e => {
-     if (e.key === 'F9' || e.code === 'F9') {
-       e.preventDefault();
-       f9Count++;
-       if (f9Timer) clearTimeout(f9Timer);
-       f9Timer = setTimeout(dispatch, F9_WINDOW_MS);
-     }
+   document.addEventListener('keydown', async e => {
+     if (e.key !== 'F9' && e.code !== 'F9') return;
+     e.preventDefault();
+     const resp = await fetch('http://localhost:8080/still', { cache: 'no-store' });
+     if (!resp.ok) return;
+     const blob = await resp.blob();
+     // ...render or upload the blob...
    });
    ```
 
-For reference, `helper.cpp`'s embedded `INDEX_HTML` string is a complete working example of both.
+3. **Put "clear / undo / re-take" in the web app's own UI.** Those gestures used to be bound to double/triple-click on the hardware button; on the HT-B30S that turned out to be mechanically unreliable (see [`../docs/NEXT-SESSION.md`](../docs/NEXT-SESSION.md) for the full post-mortem). UI buttons or keyboard shortcuts are the right home.
+
+For reference, `helper.cpp`'s embedded `INDEX_HTML` string is a complete working example.
 
 ### Mixed-content caveat
 
@@ -224,15 +192,11 @@ If your production web app is served over HTTPS and the helper serves HTTP at `h
 
 ## Known issues (worth reading before building on this)
 
-### Multi-click (double / triple) is currently not detected
+### Multi-click (double / triple) is not supported by design
 
-This is the biggest open bug. With the current configuration (preview 1600×1200, still 320×240, `debounce_ms=150`, `group_ms=800`), rapid clicks are registered as **a single click every time** — only one `still trigger accepted` log line per click burst, no matter the cadence. Single click + F9 capture works reliably; double/triple do not.
+The hardware button fires one still per press and that's all we get. We investigated exhaustively whether double/triple-click gestures could be detected reliably; the short answer is no — the device's UVC driver picks a high-bandwidth USB alt-setting at any Capture-pin resolution above 320×240, which crowds out the Still-pin deliveries for clicks 2 and 3 of a rapid burst. The 2nd/3rd clicks never arrive at user-mode. Lowering the Capture pin to 320×240 fixes it but reduces capture quality to below dermoscopy-usable. See [`../docs/NEXT-SESSION.md`](../docs/NEXT-SESSION.md) for the full per-experiment post-mortem.
 
-We've confirmed the root cause is **not** the click-grouping logic: the Still-pin SampleGrabber itself is only called once per burst, so there's nothing for the grouper to count. Something upstream — the device firmware, DirectShow, or USB-bandwidth contention with the high-res Preview stream — is absorbing the 2nd/3rd rapid presses.
-
-A full write-up of what we know, what we tried, and the concrete experiments to run next is in [`../docs/NEXT-SESSION.md`](../docs/NEXT-SESSION.md). Short version: the most promising next step is lowering preview resolution (e.g. 640×480) and re-testing. If multi-click starts working at low preview res, the bottleneck is USB bandwidth; if it still doesn't, the device firmware is the limit and the UX needs to drop multi-click entirely.
-
-**Practical workaround until this is fixed:** rely on **single click only** for capture. Put clear / undo / navigate into the web app's own UI (buttons, keyboard shortcuts, gestures).
+**Practical consequence:** "clear", "undo", "re-take", "navigate" etc. need to live in the web app's own UI (buttons / keyboard shortcuts / gestures), not on the hardware button.
 
 ### Single-consumer device
 
@@ -244,7 +208,7 @@ Only one app can stream from the dermoscope at a time on Windows. If anything el
 
 ### Preview and capture share one buffer
 
-The captured image (`/still`) is a snapshot of the Preview pin at the moment the user pressed the button. If you lower the Capture-pin resolution to reduce USB load, captured images drop in resolution too. This is a deliberate trade-off: it lets us keep the Still pin tiny (fast multi-click) while still delivering high-res captures from the Preview pin. If you want high-res captures but low-res preview, you'd need to switch back to reading Still-pin bytes — which re-introduces the multi-click-choke problem we just fixed.
+The captured image (`/still`) is a snapshot of the Preview pin at the moment the user pressed the button. If you lower the Capture-pin resolution, captured images drop in resolution too. Historically this trade-off existed to keep the Still pin tiny for multi-click detection; now that multi-click is out of scope, keeping it this way is just the simplest design. If you ever want to diverge preview and capture resolution on a future device, the cleanest switch is reading Still-pin bytes directly in `StillCB::BufferCB`.
 
 ---
 
@@ -271,6 +235,6 @@ windows-helper/
 | File | When to read |
 |---|---|
 | [`../docs/INVESTIGATION.md`](../docs/INVESTIGATION.md) | Why the design is what it is — full chronology of probes, dead ends, and breakthroughs |
-| [`../docs/NEXT-SESSION.md`](../docs/NEXT-SESSION.md) | If you're picking up the multi-click tuning issue specifically |
+| [`../docs/NEXT-SESSION.md`](../docs/NEXT-SESSION.md) | Post-mortem of the multi-click investigation (why we went single-click only) |
 | [`../docs/DESIGN.md`](../docs/DESIGN.md) | Original project design (mostly superseded by INVESTIGATION.md for Windows) |
 | [`../dermoscope-helper/README.md`](../dermoscope-helper/README.md) | The original Go helper (works on Linux/macOS with caveats; **broken on Windows**) |

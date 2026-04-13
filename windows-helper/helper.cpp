@@ -1,34 +1,33 @@
-// Dermoscope helper for Windows (approach C).
+// Dermoscope helper for Windows (approach C, single-click).
 //
-// Owns the dermoscope camera via DirectShow. Serves an MJPEG preview and a
-// full-resolution still-capture endpoint over HTTP, and emits a sequence of
-// F9 keystrokes via SendInput matching the count of physical button presses
-// (1=single, 2=double, 3=triple; 4+ is clamped to 3).
-//
-// F9 was chosen as the only keystroke (vs F10/F11) because F10 activates the
-// window menu bar in many Windows apps and F11 toggles browser fullscreen.
-// The web app is expected to count F9 keydowns arriving within a short window
-// (~300-500 ms) to decide the action.
+// Owns the HT-B30S dermoscope camera via DirectShow, serves an MJPEG live
+// preview and a full-resolution still-capture endpoint over HTTP, and emits
+// one F9 keystroke per hardware-button press via SendInput.
 //
 // Endpoints (default port 8080):
-//   GET /          -> minimal HTML test page (preview + capture + F9 sequence handler)
-//   GET /preview   -> multipart/x-mixed-replace MJPEG stream (low-res, always on)
-//   GET /still     -> image/jpeg of the most recent button-triggered still (high-res)
+//   GET /          -> minimal HTML test page (preview + capture + F9 handler)
+//   GET /preview   -> multipart/x-mixed-replace MJPEG stream (1600x1200 live)
+//   GET /still     -> image/jpeg of the most recent button-triggered still
 //
 // Web-app integration contract:
 //   - <img src="http://localhost:8080/preview"> for live video
-//   - listen for F9 keydown; buffer arrivals until a short quiet window elapses;
-//     dispatch single/double/triple action based on the count; fetch /still for
-//     the high-res JPEG when the action is "capture"
+//   - listen for F9 keydown; on receipt, fetch('/still') for the full-res JPEG
 //
 // DirectShow graph:
 //   SourceFilter (HT-B30S)
 //     ├── Capture pin (MJPG 1600x1200) -> SampleGrabber (PreviewCB) -> NullRenderer
-//     │     -- feeds /preview (live stream) AND /still (snapshot at click moment)
+//     │     -- feeds /preview (live) AND serves as the source of /still
 //     └── Still pin   (MJPG 320x240)   -> SampleGrabber (StillCB)   -> NullRenderer
-//           -- used ONLY as the hardware-button trigger; its bytes are discarded.
-//              Kept at 320x240 because higher-res stills make the device's
-//              firmware cooldown too long to detect rapid multi-clicks.
+//           -- used ONLY as the hardware-button trigger; bytes are discarded.
+//              On trigger, we snapshot the latest Capture-pin preview frame
+//              into the /still buffer so /still is always a 1600x1200 JPEG.
+//
+// Why single-click only: the device has a USB alt-setting threshold between
+// 320x240 and 640x480 on the Capture pin. Above 320x240 the bandwidth
+// reservation crowds out Still-pin IRPs, so clicks 2/3 of a rapid burst are
+// dropped by the driver before reaching us. Multi-click detection is
+// mechanically unreliable on this hardware; clear/undo gestures live in the
+// web app UI instead. Full investigation: docs/INVESTIGATION.md.
 
 #define WIN32_LEAN_AND_MEAN
 #define _WIN32_WINNT 0x0601
@@ -45,16 +44,14 @@
 #include <condition_variable>
 #include <vector>
 #include <atomic>
-#include <queue>
 #include <chrono>
 
 #pragma comment(lib, "ws2_32.lib")
 
-// ---- Click-pattern tuning (overridable from argv) ----
-// Device throttles stills to ~515 ms min gap on rapid clicks, so g_group_ms
-// must comfortably exceed that. See docs/NEXT-SESSION.md for background.
-static DWORD g_debounce_ms = 150;
-static DWORD g_group_ms    = 800;
+// Software debounce for the hardware button. The device's own firmware has
+// a multi-second cooldown between stills at these settings, so this is
+// defense-in-depth only against spurious rapid triggers. Override via argv[2].
+static DWORD g_debounce_ms = 300;
 
 // ---- DirectShow CLSIDs / IIDs not always in mingw headers ----
 static const CLSID CLSID_SampleGrabber_local =
@@ -138,9 +135,7 @@ public:
 class StillCB : public ISampleGrabberCB_local {
 public:
     LONG ref = 1;
-    std::queue<DWORD> press_queue;
-    std::mutex queue_mu;
-    std::condition_variable queue_cv;
+    std::mutex tick_mu;
     DWORD last_press_tick = 0;
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override {
@@ -154,84 +149,40 @@ public:
     ULONG STDMETHODCALLTYPE Release() override { return InterlockedDecrement(&ref); }
     HRESULT STDMETHODCALLTYPE SampleCB(double, IMediaSample*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE BufferCB(double, BYTE *pBuf, long len) override {
-        (void)pBuf;  // Still pin bytes are discarded; we snapshot the preview frame instead.
+        (void)pBuf;  // Still-pin bytes are discarded; we snapshot the preview.
         DWORD now = GetTickCount();
-        bool first_in_burst = false;
         {
-            std::lock_guard<std::mutex> lk(queue_mu);
+            std::lock_guard<std::mutex> lk(tick_mu);
             DWORD since = now - last_press_tick;
             if (last_press_tick != 0 && since < g_debounce_ms) {
                 log_ts("  still trigger (%ld bytes, +%lums) DEBOUNCED", len, since);
                 return S_OK;
             }
             last_press_tick = now;
-            first_in_burst = press_queue.empty();
-            press_queue.push(now);
-            log_ts("  still trigger (%ld bytes, +%lums) accepted (q=%zu%s)",
-                   len, since, press_queue.size(),
-                   first_in_burst ? ", first-in-burst -> snapshot preview" : "");
-            queue_cv.notify_one();
         }
-        // On the first click of a burst, snapshot the latest high-res preview
-        // frame into g_latestStill (the buffer served by GET /still). We do
-        // this here -- not in the grouper -- so the snapshot reflects the
-        // click moment, not 800ms later after the grouper decides.
-        if (first_in_burst) {
-            std::vector<BYTE> snapshot;
-            {
-                std::lock_guard<std::mutex> plk(g_previewMutex);
-                snapshot = g_latestPreview;
-            }
-            if (!snapshot.empty()) {
-                size_t sz = snapshot.size();
-                std::lock_guard<std::mutex> slk(g_stillMutex);
-                g_latestStill = std::move(snapshot);
-                g_stillSeq.fetch_add(1);
-                log_ts("  captured preview frame into /still buffer: %zu bytes", sz);
-            } else {
-                log_ts("  preview frame not yet ready; /still unchanged");
-            }
+        // Snapshot the latest high-res preview frame into /still.
+        std::vector<BYTE> snapshot;
+        {
+            std::lock_guard<std::mutex> plk(g_previewMutex);
+            snapshot = g_latestPreview;
         }
+        if (!snapshot.empty()) {
+            size_t sz = snapshot.size();
+            std::lock_guard<std::mutex> slk(g_stillMutex);
+            g_latestStill = std::move(snapshot);
+            g_stillSeq.fetch_add(1);
+            log_ts("  still trigger -> /still %zu bytes, sending F9", sz);
+        } else {
+            log_ts("  still trigger -> preview not ready; /still unchanged, sending F9");
+        }
+        // Send a single F9 keystroke.
+        INPUT inp[2] = {0};
+        inp[0].type = INPUT_KEYBOARD;
+        inp[0].ki.wVk = VK_F9;
+        inp[1] = inp[0];
+        inp[1].ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput(2, inp, sizeof(INPUT));
         return S_OK;
-    }
-
-    void run_grouper() {
-        while (g_running) {
-            std::unique_lock<std::mutex> lk(queue_mu);
-            queue_cv.wait(lk, [&]{ return !press_queue.empty() || !g_running; });
-            if (!g_running) break;
-            for (;;) {
-                DWORD last = press_queue.back();
-                DWORD now = GetTickCount();
-                DWORD elapsed = now - last;
-                if (elapsed >= g_group_ms) break;
-                queue_cv.wait_for(lk, std::chrono::milliseconds(g_group_ms - elapsed));
-                if (!g_running) return;
-            }
-            int n_raw = (int)press_queue.size();
-            std::queue<DWORD> empty;
-            std::swap(press_queue, empty);
-            lk.unlock();
-
-            // Clamp to max 3 (4+ clicks -> triple).
-            int n = n_raw > 3 ? 3 : n_raw;
-            if (n <= 0) continue;
-
-            log_ts("CLICK PATTERN: raw=%d clamped=%d -> sending %d F9 keystroke(s)",
-                   n_raw, n, n);
-
-            // Send N F9 keystrokes spaced ~40ms apart. Web app counts F9s
-            // arriving within its own grouping window and decides the action.
-            for (int i = 0; i < n; ++i) {
-                if (i > 0) Sleep(40);
-                INPUT inp[2] = {0};
-                inp[0].type = INPUT_KEYBOARD;
-                inp[0].ki.wVk = VK_F9;
-                inp[1] = inp[0];
-                inp[1].ki.dwFlags = KEYEVENTF_KEYUP;
-                SendInput(2, inp, sizeof(INPUT));
-            }
-        }
     }
 };
 
@@ -331,20 +282,17 @@ static const char INDEX_HTML[] =
 "  img, canvas { max-width: 100%; border: 1px solid #888; background: #111; }\n"
 "  h2 { margin: 0 0 8px; }\n"
 "  #status { margin-top: 8px; font-family: monospace; }\n"
+"  button { margin-top: 8px; padding: 6px 14px; font-size: 14px; }\n"
 "</style></head><body>\n"
-"<h1>Dermoscope helper — test page</h1>\n"
-"<p>Live preview streams from <code>/preview</code>. Button press -&gt; F9 -&gt; page fetches <code>/still</code> for the full-res capture.</p>\n"
+"<h1>Dermoscope helper - test page</h1>\n"
+"<p>Press the hardware button (or F9) to capture a full-res still from <code>/still</code>.</p>\n"
 "<div class=\"row\">\n"
-"  <div class=\"col\"><h2>Live preview (low-res)</h2><img id=\"live\" src=\"/preview\" /></div>\n"
-"  <div class=\"col\"><h2>Last capture (full-res)</h2><canvas id=\"captured\"></canvas></div>\n"
+"  <div class=\"col\"><h2>Live preview</h2><img id=\"live\" src=\"/preview\" /></div>\n"
+"  <div class=\"col\"><h2>Last capture</h2><canvas id=\"captured\"></canvas>\n"
+"    <div><button id=\"clear\">Clear</button></div></div>\n"
 "</div>\n"
-"<div id=\"status\">Waiting... (single F9=capture, double F9=no-op, triple F9=clear)</div>\n"
+"<div id=\"status\">Waiting for capture...</div>\n"
 "<script>\n"
-"// F9 sequence detection: buffer F9 keydowns, wait for a short quiet window,\n"
-"// then dispatch by count. 1=capture, 2=no-op, 3(+)=clear.\n"
-"const F9_WINDOW_MS = 400;\n"
-"let f9Count = 0;\n"
-"let f9Timer = null;\n"
 "let captureNum = 0;\n"
 "const statusEl = () => document.getElementById('status');\n"
 "function setStatus(t) { statusEl().textContent = t; }\n"
@@ -367,32 +315,14 @@ static const char INDEX_HTML[] =
 "    img.src = url;\n"
 "  } catch(e) { setStatus(`fetch /still error: ${e.message}`); }\n"
 "}\n"
-"function noop() { setStatus('Double F9 (no-op, last capture unchanged)'); }\n"
-"function clearCap() {\n"
+"document.addEventListener('keydown', e => {\n"
+"  if (e.key === 'F9' || e.code === 'F9') { e.preventDefault(); capture(); }\n"
+"});\n"
+"document.getElementById('live').addEventListener('click', capture);\n"
+"document.getElementById('clear').addEventListener('click', () => {\n"
 "  const canvas = document.getElementById('captured');\n"
 "  canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);\n"
-"  setStatus('Triple F9 (cleared)');\n"
-"}\n"
-"function dispatchF9Sequence() {\n"
-"  const n = Math.min(f9Count, 3);\n"
-"  f9Count = 0;\n"
-"  if (n === 1) capture();\n"
-"  else if (n === 2) noop();\n"
-"  else if (n >= 3) clearCap();\n"
-"}\n"
-"document.addEventListener('keydown', e => {\n"
-"  if (e.key === 'F9' || e.code === 'F9') {\n"
-"    e.preventDefault();\n"
-"    f9Count++;\n"
-"    if (f9Timer) clearTimeout(f9Timer);\n"
-"    f9Timer = setTimeout(dispatchF9Sequence, F9_WINDOW_MS);\n"
-"  }\n"
-"});\n"
-"// click on live image to simulate a single F9 (handy for manual testing).\n"
-"document.getElementById('live').addEventListener('click', () => {\n"
-"  f9Count++;\n"
-"  if (f9Timer) clearTimeout(f9Timer);\n"
-"  f9Timer = setTimeout(dispatchF9Sequence, F9_WINDOW_MS);\n"
+"  setStatus('Cleared');\n"
 "});\n"
 "</script>\n"
 "</body></html>\n";
@@ -470,7 +400,7 @@ static void serve_client(SOCKET sock) {
             const char *r = "HTTP/1.0 404 Not Found\r\n"
                             "Content-Type: text/plain\r\n"
                             "Access-Control-Allow-Origin: *\r\n"
-                            "Content-Length: 28\r\n"
+                            "Content-Length: 22\r\n"
                             "Connection: close\r\n\r\n"
                             "no still captured yet\n";
             send_all(sock, r, (int)strlen(r));
@@ -524,8 +454,7 @@ static void http_server(int port) {
 int main(int argc, char **argv) {
     int port = (argc > 1) ? atoi(argv[1]) : 8080;
     if (argc > 2) g_debounce_ms = (DWORD)atoi(argv[2]);
-    if (argc > 3) g_group_ms    = (DWORD)atoi(argv[3]);
-    log_ts("Config: port=%d debounce_ms=%lu group_ms=%lu", port, g_debounce_ms, g_group_ms);
+    log_ts("Config: port=%d debounce_ms=%lu", port, g_debounce_ms);
 
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
@@ -542,24 +471,10 @@ int main(int argc, char **argv) {
     pBuilder->SetFiltergraph(pGraph);
     pGraph->AddFilter(pSrc, L"Source");
 
-    // Preview: pick the device's highest MJPG (1600x1200). That gives us both
-    // a sharp live stream at /preview AND a sharp snapshot on button press
-    // (we copy the latest preview frame into /still when the Still pin fires).
-    //
-    // Still: pick the smallest MJPG (320x240). Still bytes are discarded; the
-    // only thing that matters is firing fast enough to detect rapid clicks.
-    // At high resolution the device's firmware stretches its post-still
-    // cooldown long enough that the 2nd/3rd clicks get dropped -- observed
-    // empirically and fixed by keeping the still pin small.
-    // Capture pin at 1280x960: high-res enough for quality dermoscopy captures
-    // (served via /still as a snapshot of the latest preview frame) while
-    // keeping continuous USB bandwidth (~2.5 MB/s) well below the cliff where
-    // multi-click detection breaks. 1600x1200 was confirmed broken (~9 MB/s
-    // saturated the bus and caused Still-pin deliveries for clicks 2/3 of a
-    // burst to be dropped upstream); 320x240 was confirmed working. Binary-
-    // searching down from here if 1280x960 turns out to still break clicks.
-    configure_format(pSrc, pBuilder, &PIN_CATEGORY_CAPTURE,  320,  240);
-    configure_format(pSrc, pBuilder, &PIN_CATEGORY_STILL,   320,  240);
+    // Capture pin at 1600x1200 MJPG: live preview + source of /still snapshot.
+    // Still pin at 320x240 MJPG: hardware-button trigger only; bytes discarded.
+    configure_format(pSrc, pBuilder, &PIN_CATEGORY_CAPTURE, 9999, 9999);
+    configure_format(pSrc, pBuilder, &PIN_CATEGORY_STILL,    320,  240);
 
     // Capture pin -> Preview SampleGrabber -> NullRenderer
     IBaseFilter *pPrevGrab = NULL;
@@ -619,12 +534,9 @@ int main(int argc, char **argv) {
 
     std::thread server(http_server, port);
     server.detach();
-    std::thread grouper(&StillCB::run_grouper, pStillCB);
-    grouper.detach();
 
     log_ts("Helper ready. Open http://localhost:%d/ in your browser.", port);
-    log_ts("Click pattern: 1=F9 (capture), 2=F10 (no-op), 3=F11 (clear).");
-    log_ts("Ctrl-C to quit.");
+    log_ts("Hardware button -> F9 -> web app fetches /still. Ctrl-C to quit.");
 
     while (g_running) Sleep(1000);
 
