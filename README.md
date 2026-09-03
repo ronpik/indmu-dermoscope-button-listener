@@ -10,26 +10,19 @@ The dermoscope's physical capture button does **not** emit a keyboard event and 
 
 ## Solution Summary
 
-A small cross-platform Go application that:
+Windows 11 is the primary platform, and the shipping Windows implementation is the native C++ helper under `windows-helper/`: it owns the camera via DirectShow, serves preview and still-capture over local HTTP, and turns the hardware button into an `F9` keystroke. Prebuilt `helper.exe` binaries are published on the [Releases page](https://github.com/ronpik/indmu-dermoscope-button-listener/releases/latest).
 
-1. Detects the dermoscope by VID/PID.
-2. Claims the Video Control interface and reads its interrupt endpoint.
-3. Parses the 4-byte UVC button event and debounces it.
-4. Emits a virtual `F9` keypress which the TrichoAI web app listens for.
-5. Runs in the system tray with auto-reconnect and status indicators.
-
-Windows 11 is the primary platform. macOS is secondary and has a known limitation: claiming the Video Control interface is exclusive at the kernel level, so while the helper runs the camera is unavailable to browsers.
+The earlier cross-platform Go helper (`dermoscope-helper/`) takes a different route — it claims the UVC Video Control interface and reads its interrupt endpoint directly. That works on Linux and, with caveats, on macOS, where claiming the interface is exclusive at the kernel level so the camera becomes unavailable to browsers while the helper runs. It does **not** work on Windows with this device.
 
 ## Repo Layout
 
 | Path | Purpose |
 |------|---------|
-| `dermoscope-helper/` | **Production Go implementation** — the helper app (cmd + internal modules + Makefile + build scripts). See its own `README.md` for install, usage, config, and supported devices. |
+| `windows-helper/` | **Production Windows implementation** — single-file C++ helper, built with mingw-w64 (`make static`) and shipped from the Releases page as `helper.exe`. See its own `README.md`. |
+| `dermoscope-helper/` | Original Go helper — Linux / macOS only, **broken on Windows** with this device. See its own `README.md` for install, usage, config, and supported devices. |
 | `docs/DESIGN.md` | Full design document: background, USB protocol analysis, alternatives considered, platform trade-offs, architecture, device-profile system. |
 | `docs/GO-SPECS.md` | Implementation spec for the Go helper: modules, dependencies, build targets, functional requirements (P0 / P1). |
 | `dermoscope_helper.py`, `dermoscope_helper_v2.py`, `dermoscope_helper_v3.py` | Early Python prototypes (kept for historical reference — see below). |
-| `dermoscope_investigation/` | Python virtualenv used during the investigation (no notes inside; the investigation findings are written up in `docs/DESIGN.md`). |
-| `impl/go/` | Empty placeholder from the previous repo layout — the real Go code lives in `dermoscope-helper/`. |
 
 ## Chain of Events That Led Here
 
@@ -38,9 +31,13 @@ Windows 11 is the primary platform. macOS is secondary and has a known limitatio
 3. **v3 — `dermoscope_helper_v3.py`** — Interactive troubleshooter that tries reading without detaching the kernel driver, raw libusb reads, and UVC control-transfer monitoring. All failed on macOS due to `AppleUSBVideoControl` exclusivity.
 4. **Conclusion** — macOS kernel-driver exclusivity is the root limitation; Windows is the practical primary target. The investigation is written up in `docs/DESIGN.md`.
 5. **Go helper** — Rewrite in Go for a single static binary, good USB support (`gousb`), cross-platform tray support, and easy cross-compilation. See `dermoscope-helper/` and `docs/GO-SPECS.md`.
+6. **Windows C++ helper** — `gousb` could not claim the interface on Windows (usbvideo.sys owns it), so the Windows path was rebuilt natively on DirectShow: the helper owns the camera and serves preview / stills over local HTTP. This is what ships. See `windows-helper/` and `docs/INVESTIGATION.md`.
 
 ## Where to Read Next
 
-- Using / installing the helper → [`dermoscope-helper/README.md`](dermoscope-helper/README.md)
+- Installing / running on Windows → [`windows-helper/README.md`](windows-helper/README.md) and the [Releases page](https://github.com/ronpik/indmu-dermoscope-button-listener/releases/latest)
+- Handing the Windows helper to a pilot customer → [`windows-helper/CLIENT-HANDOFF.md`](windows-helper/CLIENT-HANDOFF.md)
+- Using / installing the Go helper (Linux / macOS) → [`dermoscope-helper/README.md`](dermoscope-helper/README.md)
+- Why the Windows design is what it is → [`docs/INVESTIGATION.md`](docs/INVESTIGATION.md)
 - Why it works this way, USB protocol details, alternatives that failed → [`docs/DESIGN.md`](docs/DESIGN.md)
 - How the Go app is structured and what each module does → [`docs/GO-SPECS.md`](docs/GO-SPECS.md)
