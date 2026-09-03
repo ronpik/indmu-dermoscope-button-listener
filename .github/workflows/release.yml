@@ -58,8 +58,13 @@ jobs:
         shell: msys2 {0}
 
     steps:
+      # Action majors below are the Node 24 runtimes: checkout v5+, upload-artifact
+      # v6+ and action-gh-release v3+. Anything older declares `node20` and makes
+      # the runner log a deprecation warning while shimming it onto Node 24.
+      # Note upload-artifact v5 is still node20 despite its release notes -- v6 is
+      # the actual switch. Do not downgrade these without checking `runs.using`.
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # No `update:` on purpose. A full `pacman -Syuu` on every release run adds
       # minutes, is the usual source of flaky MSYS2 CI (mirror timeouts, locked
@@ -180,7 +185,7 @@ jobs:
       # release zip would hand the downloader a zip inside a near-identically
       # named zip.
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: helper-${{ env.VERSION }}-windows-x64
           path: windows-helper/dist-static/helper.exe
@@ -193,7 +198,7 @@ jobs:
       # green run.
       - name: Attach assets to the release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           fail_on_unmatched_files: true
           files: |
