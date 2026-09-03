@@ -698,7 +698,7 @@ static bool http_server_start(int port) {
     sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_port = htons((u_short)port);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
     if (bind(srv, (sockaddr*)&addr, sizeof(addr)) < 0) {
         log_ts("bind() failed on port %d: %d", port, WSAGetLastError());
         closesocket(srv);
