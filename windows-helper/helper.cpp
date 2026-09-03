@@ -171,6 +171,10 @@ static std::atomic<long long> g_sessionStartMs{0};
 // that Stop -> Start cycles work: stop_capture() clears it, start_capture()
 // sets it again.
 static std::atomic<bool> g_serverRunning{false};
+// Incremented for every successful HTTP-server Start. A preview handler keeps
+// the generation it joined so a thread that outlives Stop's bounded drain can
+// never resume against a later Start when g_serverRunning becomes true again.
+static std::atomic<unsigned long long> g_serverGeneration{0};
 
 enum class HelperState { Stopped, Running, DeviceNotFound, CameraBusy, Error };
 static std::atomic<HelperState> g_state{HelperState::Stopped};
@@ -551,6 +555,48 @@ static std::mutex g_clientMu;
 static std::set<SOCKET> g_clientSocks;
 static std::atomic<int> g_clientThreads{0};
 
+// Track active preview viewers for /health and diagnostics. Every viewer gets
+// every published frame: reducing each viewer's cadence when another tab opens
+// makes the clinical preview visibly choppy. Slow viewers remain isolated in
+// their own client thread and catch up from g_latestPreview after a send.
+static std::mutex g_previewClientMu;
+static std::set<unsigned long long> g_previewClientIds;
+static std::atomic<unsigned long long> g_nextPreviewClientId{1};
+
+static int preview_client_count() {
+    std::lock_guard<std::mutex> lk(g_previewClientMu);
+    return (int)g_previewClientIds.size();
+}
+
+static void reset_preview_clients() {
+    std::lock_guard<std::mutex> lk(g_previewClientMu);
+    g_previewClientIds.clear();
+}
+
+class PreviewClientRegistration {
+public:
+    PreviewClientRegistration()
+        : id_(g_nextPreviewClientId.fetch_add(1)),
+          generation_(g_serverGeneration.load()) {
+        std::lock_guard<std::mutex> lk(g_previewClientMu);
+        g_previewClientIds.insert(id_);
+    }
+    ~PreviewClientRegistration() {
+        std::lock_guard<std::mutex> lk(g_previewClientMu);
+        g_previewClientIds.erase(id_);
+    }
+
+    unsigned long long generation() const { return generation_; }
+
+    PreviewClientRegistration(const PreviewClientRegistration&) = delete;
+    PreviewClientRegistration& operator=(
+        const PreviewClientRegistration&) = delete;
+
+private:
+    unsigned long long id_;
+    unsigned long long generation_;
+};
+
 // Returns false if the peer went away mid-write; a short send() is retried so
 // a JPEG is never silently truncated.
 static bool send_all(SOCKET s, const char *buf, int len) {
@@ -611,6 +657,7 @@ static void handle_client(SOCKET sock) {
     }
 
     if (strcmp(path, "/preview") == 0) {
+        PreviewClientRegistration previewClient;
         const char *hdr =
             "HTTP/1.0 200 OK\r\n"
             "Connection: close\r\n"
@@ -618,22 +665,40 @@ static void handle_client(SOCKET sock) {
             "Pragma: no-cache\r\n"
             "Access-Control-Allow-Origin: *\r\n"
             "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
-        send_all(sock, hdr, (int)strlen(hdr));
+        if (!send_all(sock, hdr, (int)strlen(hdr))) {
+            log_ts("Preview client disconnected while sending headers "
+                   "(WSA error %d, %d preview client(s) active).",
+                   WSAGetLastError(), preview_client_count());
+            return;
+        }
 
         // Start from the CURRENT sequence number, not -1: with -1 a client that
         // connects before the first frame arrives would immediately pass the
         // predicate and emit an empty Content-Length: 0 part.
         long long lastSeq = g_previewSeq.load();
-        while (g_serverRunning) {
+        while (g_serverRunning &&
+               g_serverGeneration.load() == previewClient.generation()) {
             std::vector<BYTE> frame;
+            long long currentSeq = lastSeq;
             {
                 std::unique_lock<std::mutex> lk(g_previewMutex);
-                g_previewCV.wait_for(lk, std::chrono::seconds(2),
-                                    [&]{ return g_previewSeq.load() != lastSeq || !g_serverRunning; });
-                if (!g_serverRunning) break;
+                g_previewCV.wait_for(
+                    lk,
+                    std::chrono::seconds(2),
+                    [&] {
+                        return g_previewSeq.load() != lastSeq ||
+                               !g_serverRunning ||
+                               g_serverGeneration.load() !=
+                                   previewClient.generation();
+                    });
+                if (!g_serverRunning ||
+                    g_serverGeneration.load() != previewClient.generation()) {
+                    break;
+                }
                 if (g_previewSeq.load() == lastSeq) continue;
+                currentSeq = g_previewSeq.load();
+                lastSeq = currentSeq;
                 frame = g_latestPreview;
-                lastSeq = g_previewSeq.load();
             }
             // Never emit a zero-byte part, and skip anything that isn't a JPEG:
             // the part must start with SOI (FF D8). Only SOI is checked -- many
@@ -644,9 +709,14 @@ static void handle_client(SOCKET sock) {
             int plen = snprintf(part, sizeof(part),
                 "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n",
                 frame.size());
-            if (!send_all(sock, part, plen)) break;
-            if (!send_all(sock, (const char*)frame.data(), (int)frame.size())) break;
-            if (!send_all(sock, "\r\n", 2)) break;
+            if (!send_all(sock, part, plen) ||
+                !send_all(sock, (const char*)frame.data(), (int)frame.size()) ||
+                !send_all(sock, "\r\n", 2)) {
+                log_ts("Preview client disconnected while sending frame %lld "
+                       "(WSA error %d, %d preview client(s) active).",
+                       currentSeq, WSAGetLastError(), preview_client_count());
+                break;
+            }
         }
         return;
     }
@@ -705,6 +775,7 @@ static void handle_client(SOCKET sock) {
         body += "{\"status\":\"running\",\"version\":\"" + json_escape(HELPER_VERSION) + "\"";
         body += ",\"device\":\"" + json_escape(device) + "\"";
         body += ",\"preview_frames\":" + std::to_string(g_previewSeq.load());
+        body += ",\"preview_clients\":" + std::to_string(preview_client_count());
         body += ",\"still_seq\":" + std::to_string(g_stillSeq.load());
         body += std::string(",\"still_available\":") + (stillAvailable ? "true" : "false");
         body += ",\"port\":" + std::to_string(g_port);
@@ -844,6 +915,8 @@ static bool http_server_start(int port) {
         return false;
     }
     g_listenSock = srv;
+    reset_preview_clients();
+    g_serverGeneration.fetch_add(1);
     g_serverRunning = true;
     g_sessionStartMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
