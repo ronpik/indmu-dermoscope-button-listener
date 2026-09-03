@@ -539,7 +539,11 @@ static void handle_client(SOCKET sock) {
                 frame = g_latestPreview;
                 lastSeq = g_previewSeq.load();
             }
-            if (frame.empty()) continue;      // never emit a zero-byte part
+            // Never emit a zero-byte part, and skip anything that isn't a JPEG:
+            // the part must start with SOI (FF D8). Only SOI is checked -- many
+            // UVC cameras (this Sonix chipset included) omit the trailing EOI
+            // marker, so gating on it would drop every frame.
+            if (frame.size() < 2 || frame[0] != 0xFF || frame[1] != 0xD8) continue;
             char part[256];
             int plen = snprintf(part, sizeof(part),
                 "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n",
