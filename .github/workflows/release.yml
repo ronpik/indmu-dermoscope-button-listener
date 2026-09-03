@@ -1,0 +1,201 @@
+# Release
+#
+# Builds the Windows dermoscope helper (windows-helper/helper.cpp) with mingw-w64
+# inside an MSYS2 MINGW64 shell -- the same `make static` used locally -- and
+# publishes the single-file dist-static/helper.exe.
+#
+# How it runs:
+#
+#   * Publishing a GitHub release tagged vX.Y.Z builds with VERSION=X.Y.Z (the
+#     leading "v" is stripped) and attaches two assets to that release:
+#     `helper.exe` (the stable name docs and clients depend on -- do not rename)
+#     and `helper-X.Y.Z-windows-x64.zip`.
+#
+#   * Manual smoke test: Actions tab -> "Release" -> "Run workflow". The optional
+#     "version" input is stamped into the build and defaults to 0.0.0-dev.
+#     Manual runs never touch a release; the binary shows up as a downloadable
+#     run artifact instead.
+#
+# The build always produces a run artifact, so a manual run exercises the whole
+# build and packaging path. The only step it does not reach is "Attach assets to
+# the release", which is gated on the release event.
+#
+# Note: GitHub reads both triggers from the DEFAULT branch -- this file has to be
+# merged to `main` before "Run workflow" appears in the Actions tab or before
+# publishing a release fires anything.
+
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to stamp into the build (no leading "v")'
+        required: false
+        default: '0.0.0-dev'
+        type: string
+
+# Only what is needed to attach assets to a release. Nothing else is granted.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and publish helper.exe
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    # Every `run` step in this job uses the MSYS2 MINGW64 bash provided by
+    # msys2/setup-msys2 (so make, g++, windres, zip and sha256sum are all on
+    # PATH in one shell). This is safe as a job-level default *only* because
+    # the two steps that precede the setup action are `uses:` steps with no
+    # `run:` -- a run step before setup-msys2 would fail with "shell not found".
+    # Keep it that way: new run steps go after the "Set up MSYS2" step.
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # No `update:` on purpose. A full `pacman -Syuu` on every release run adds
+      # minutes, is the usual source of flaky MSYS2 CI (mirror timeouts, locked
+      # pacman db, a mid-run shell restart), and lets the toolchain drift between
+      # two builds of the same tag. The pinned base image plus the explicit
+      # `install:` list below is everything this build needs.
+      - name: Set up MSYS2 (MINGW64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-binutils
+            make
+            zip
+
+      # Release event -> tag name minus the leading "v". Manual run -> the input.
+      # The contexts are passed through `env:` rather than interpolated straight
+      # into the script, so nothing in a tag name can be parsed as shell.
+      - name: Determine version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "release" ]; then
+            version="${TAG_NAME#v}"
+          else
+            version="$INPUT_VERSION"
+          fi
+          if [ -z "$version" ]; then
+            echo "Could not determine a version to build." >&2
+            exit 1
+          fi
+          # Fail early on a shape that would break later steps: the artifact name
+          # rejects " : < > | * ? \ /, and a "/" would turn the zip name into a
+          # path. Also catch a dispatch input that still carries the tag's "v".
+          case "$version" in
+            v*) echo "Pass the version without the leading 'v': $version" >&2; exit 1 ;;
+          esac
+          printf '%s' "$version" | grep -Eq '^[0-9]+(\.[0-9]+){0,3}(-[0-9A-Za-z.]+)?$' || {
+            echo "Not a usable version string: $version" >&2
+            exit 1
+          }
+          echo "Building version: $version"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Build (make static)
+        working-directory: windows-helper
+        run: |
+          set -euo pipefail
+          make static VERSION="$VERSION"
+          ls -la dist-static/
+
+      # ----------------------------------------------------------------------
+      # PLACEHOLDER -- CODE SIGNING IS NOT SET UP YET.
+      #
+      # Everything in this block is a YAML comment. It does not run, and none of
+      # the secrets below exist in this repository today. Released binaries are
+      # currently UNSIGNED and Windows SmartScreen will warn about them.
+      #
+      # When a signing identity is available, uncomment the step and drop it in
+      # right here -- after the build, before the checksum and zip -- so that the
+      # checksum, the zip and the release asset all describe the *signed* exe.
+      #
+      # Secrets to create first (Settings -> Secrets and variables -> Actions):
+      #   AZURE_TENANT_ID
+      #   AZURE_CLIENT_ID
+      #   AZURE_CLIENT_SECRET
+      #
+      # - name: Sign helper.exe (Azure Trusted Signing)
+      #   uses: azure/trusted-signing-action@v0
+      #   with:
+      #     azure-tenant-id: <AZURE_TENANT_ID secret>
+      #     azure-client-id: <AZURE_CLIENT_ID secret>
+      #     azure-client-secret: <AZURE_CLIENT_SECRET secret>
+      #     endpoint: https://<region>.codesigning.azure.net/
+      #     trusted-signing-account-name: <account>
+      #     certificate-profile-name: <profile>
+      #     files-folder: <workspace>/windows-helper/dist-static
+      #     files-folder-filter: exe
+      # ----------------------------------------------------------------------
+
+      - name: Checksum and build summary
+        working-directory: windows-helper
+        run: |
+          set -euo pipefail
+          exe="dist-static/helper.exe"
+          sha="$(sha256sum "$exe" | cut -d ' ' -f 1)"
+          size="$(wc -c < "$exe" | tr -d '[:space:]')"
+          # $GITHUB_STEP_SUMMARY is a Windows-style path inside this shell, so
+          # it must stay quoted when redirected to.
+          {
+            echo "### Windows helper build"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| version | \`$VERSION\` |"
+            echo "| file | \`helper.exe\` |"
+            echo "| size | $size bytes |"
+            echo "| sha256 | \`$sha\` |"
+            echo ""
+            echo "Unsigned build (code signing not configured yet)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Package zip
+        working-directory: windows-helper
+        run: |
+          set -euo pipefail
+          zip_name="helper-$VERSION-windows-x64.zip"
+          # -j flattens paths so the archive holds helper.exe at its root.
+          zip -j "dist-static/$zip_name" dist-static/helper.exe
+          echo "ZIP_NAME=$zip_name" >> "$GITHUB_ENV"
+
+      # Unconditional: this is what makes a manual workflow_dispatch run useful.
+      # Only the bare exe goes in -- a run artifact is itself a zip, so adding the
+      # release zip would hand the downloader a zip inside a near-identically
+      # named zip.
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: helper-${{ env.VERSION }}-windows-x64
+          path: windows-helper/dist-static/helper.exe
+          if-no-files-found: error
+
+      # Release events only -- a manual run has no release to attach to.
+      # The first asset keeps the exact name `helper.exe`.
+      # fail_on_unmatched_files defaults to false: without it, an unresolved
+      # ZIP_NAME would silently publish a release with a missing asset and a
+      # green run.
+      - name: Attach assets to the release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: true
+          files: |
+            windows-helper/dist-static/helper.exe
+            windows-helper/dist-static/${{ env.ZIP_NAME }}
