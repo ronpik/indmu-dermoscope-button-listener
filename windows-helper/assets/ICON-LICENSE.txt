@@ -1,0 +1,26 @@
+Dermoscope Helper app icon (helper.ico, helper.png)
+====================================================
+
+Original artwork, not derived from any third-party icon set, font, or SVG.
+
+The icon is a rounded-square badge (#23395B navy) with a white flat-style
+microscope glyph, generated programmatically -- geometry is expressed as
+capsule/circle/rounded-rect primitives, box-filtered from a supersampled
+raster (12x for 16-32px, 8x for 48-64px, 4x for 128-256px) to get clean
+anti-aliased edges at every size, with a simplified, fatter-stroked geometry
+used at 16/24px specifically for legibility in the Windows system tray.
+
+The generation script is kept alongside the icon for reproducibility:
+    make-helper-icon.py
+
+Run it with:
+    python make-helper-icon.py <output-dir>
+
+It writes helper.ico (16, 24, 32, 48, 64, 128, 256 px) and one PNG per size
+under <output-dir>/png/. It uses only the Python standard library (zlib for
+PNG encoding, struct for the ICO container) -- no Pillow, no network access,
+no third-party assets fetched at generation time.
+
+License: same license as the rest of this repository. There is no
+third-party attribution to carry, since no external icon, image, or font was
+used as a source or reference asset.

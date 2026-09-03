@@ -39,7 +39,57 @@ This is the **working Windows path** produced by the investigation documented in
 
 ---
 
+## Install
+
+**Recommended: run the installer.** Download `DermoscopeHelper-Setup-X.Y.Z.exe` from the
+[latest release](https://github.com/ronpik/indmu-dermoscope-button-listener/releases/latest)
+(see [Releases](#releases)) and run it. There's no admin prompt — Windows won't even ask for
+elevation, because the installer requests none.
+
+What it does:
+
+- Installs **per-user, no admin, no UAC prompt** into `%LOCALAPPDATA%\Programs\Dermoscope Helper`.
+- Adds a Start Menu shortcut (and its own uninstall entry there).
+- **Desktop shortcut** — offered, unchecked by default.
+- **"Start Dermoscope Helper when I sign in"** — offered, **checked by default**: it drops a
+  shortcut in your Startup folder (`shell:startup`), so the tray icon is there without you having
+  to launch it by hand. Turn it off later without reinstalling: **Task Manager → Startup apps** →
+  disable it, or just delete the shortcut from `shell:startup`.
+- Offers to **launch the helper immediately** at the end of setup (checked by default).
+
+**Why per-user instead of Program Files:** the helper writes `helper.log` (rotated to
+`helper.log.1`) *next to its own exe*, and a machine-wide `Program Files` install is read-only to
+a non-admin process — that would silently break logging for anyone without admin rights, which
+is most people on a clinic workstation. Installing under `%LOCALAPPDATA%` keeps the exe (and the
+log beside it) writable by the same account that runs the tray app, with no elevation needed.
+
+**Upgrades:** every Setup build shares the same installer identity (fixed AppId), so running a
+newer `DermoscopeHelper-Setup-X.Y.Z.exe` installs over the old copy in place — no manual
+uninstall first, no duplicate Start Menu entries. If a helper is currently running, Setup (and
+Uninstall) will ask you to close it first: right-click the tray icon → **Exit**.
+
+**Uninstall:** **Settings → Apps → Installed apps → Dermoscope Helper → Uninstall**, or the
+"Uninstall Dermoscope Helper" entry in its Start Menu group. This removes the exe, the Start Menu
+and desktop shortcuts, the Startup-folder entry, and `helper.log` / `helper.log.1`. Nothing else
+is touched.
+
+**SmartScreen:** the installer isn't code-signed yet (same as the bare exe — see
+[Code signing](#code-signing)), so Windows may show "Windows protected your PC" on first run.
+Click **More info** → **Run anyway**.
+
+**Alternative: the portable exe, no install.** If you'd rather not install anything — a one-off
+test machine, a USB-stick drop, or you just want to run it from wherever you put it — skip the
+installer and use the bare `helper.exe` described below in [Quick start](#quick-start-end-user-on-a-fresh-windows-machine).
+Nothing is installed, nothing is registered to start at sign-in, and removing it is just deleting
+the file.
+
+---
+
 ## Quick start (end user, on a fresh Windows machine)
+
+This section covers the **portable route**: running `helper.exe` directly with no installer. If
+you want a Start Menu entry, an uninstaller, and auto-start at sign-in, use the
+[installer](#install) instead — this is the manual equivalent of what it sets up for you.
 
 1. Get `helper.exe` onto the target machine — download it from the [latest release](https://github.com/ronpik/indmu-dermoscope-button-listener/releases/latest) (see [Releases](#releases)), or copy a locally built `dist-static/helper.exe` (single file) or `dist/` (folder, exe + DLLs).
 2. Plug in the dermoscope.
@@ -146,6 +196,38 @@ Both link against **only inbox Windows DLLs** at runtime:
 
 All of those are present on every Windows 7/8/10/11 installation. No Visual C++ Redistributable required.
 
+### Building the installer (`make installer`)
+
+```bash
+make installer VERSION=1.2.3
+```
+
+Packages `dist-static/helper.exe` into a per-user Inno Setup installer at
+`dist-installer/DermoscopeHelper-Setup-1.2.3.exe`. `installer` depends on `static`, so it always
+rebuilds `dist-static/helper.exe` for the same `VERSION` first — you never have to remember to run
+`make static` yourself, and you can't accidentally ship a Setup exe wrapping a stale build.
+`VERSION` has no default here: [`installer/helper.iss`](installer/helper.iss) fails the build
+outright if it isn't given one, rather than silently producing an unversioned installer.
+
+Needs **Inno Setup 6**'s command-line compiler, `ISCC.exe` — a build-time-only dependency, not
+something the shipped installer or helper need at runtime:
+
+```powershell
+winget install JRSoftware.InnoSetup
+```
+
+The `ISCC` make variable finds it: `iscc` on `PATH` first, then Inno Setup 6's default install
+location (`C:/Program Files (x86)/Inno Setup 6/ISCC.exe`). Installed somewhere else? Override it:
+
+```bash
+make installer VERSION=1.2.3 ISCC="D:/Tools/Inno Setup 6/ISCC.exe"
+```
+
+`make check-iscc` (a dependency of `installer`) fails with that same install hint if `ISCC` can't
+be found. See [`installer/README.md`](installer/README.md) for how `helper.iss` itself is
+structured and the reasoning behind each of its settings — per-user install, the fixed AppId, the
+Startup-folder shortcut, `AppMutex`, and what breaks if you change any of them.
+
 ### The one gotcha: `qedit.dll`
 
 Microsoft deprecated `qedit.dll` long ago but it still ships with Windows 10 and 11. If a future Windows version removes it, `CoCreateInstance(CLSID_SampleGrabber)` will fail and the helper won't start. The replacement would be Media Foundation (`IMFSourceReader` + custom sink) — not done here because qedit still works today.
@@ -154,11 +236,19 @@ Microsoft deprecated `qedit.dll` long ago but it still ships with Windows 10 and
 
 ## Releases
 
-End users do not build this. They download the prebuilt exe from the repo's Releases page:
+End users do not build this. They download a prebuilt asset from the repo's Releases page:
 
 **https://github.com/ronpik/indmu-dermoscope-button-listener/releases/latest**
 
-The asset is named exactly `helper.exe` — a stable name that docs and client instructions hard-code, so it must not change between releases. `helper-<version>-windows-x64.zip`, holding the same exe at its root, is attached alongside it for browsers and AV products that block a bare `.exe` download. See [`CLIENT-HANDOFF.md`](CLIENT-HANDOFF.md) for what to tell a pilot customer.
+Each release carries three assets:
+
+| Asset | What it is |
+|---|---|
+| `DermoscopeHelper-Setup-<version>.exe` | The per-user installer — **the recommended download**. See [Install](#install). |
+| `helper.exe` | The bare static exe, unchanged — a stable name that docs and client instructions hard-code, so it must not change between releases. Portable, no install; see [Quick start](#quick-start-end-user-on-a-fresh-windows-machine). |
+| `helper-<version>-windows-x64.zip` | The same exe as above, zipped, for browsers and AV products that block a bare `.exe` download. |
+
+See [`CLIENT-HANDOFF.md`](CLIENT-HANDOFF.md) for what to tell a pilot customer.
 
 ### Cutting a release
 
@@ -185,9 +275,10 @@ The version handed to `make` is the tag with the leading `v` stripped: tag `v1.2
 |---|---|
 | Toolchain | MSYS2 with the MINGW64 mingw-w64 toolchain — the same compiler a local build uses. |
 | Build | `make static VERSION=<tag without the leading v>`, so the published exe carries the release's version in its resource metadata. |
-| Release assets | Attaches `helper.exe` and `helper-<version>-windows-x64.zip` to the published release (release events only). |
-| Workflow artifact | Uploads `helper.exe` as a run artifact, `helper-<version>-windows-x64`, on every run — so a build is retrievable from the Actions run even when there is no release. |
-| Checksum | Prints the version, byte size and SHA256 of `helper.exe` into the run summary. Verify a download with `Get-FileHash .\helper.exe -Algorithm SHA256`. |
+| Installer | Resolves `ISCC.exe` (installing Inno Setup via `choco` if the runner doesn't already have it), then `make installer VERSION=<version> ISCC=<resolved path>` to produce `DermoscopeHelper-Setup-<version>.exe`. |
+| Release assets | Attaches `helper.exe`, `helper-<version>-windows-x64.zip`, and `DermoscopeHelper-Setup-<version>.exe` to the published release (release events only). |
+| Workflow artifact | Uploads `helper.exe` and the installer exe as a run artifact, `helper-<version>-windows-x64`, on every run — so a build is retrievable from the Actions run even when there is no release. |
+| Checksum | Prints the version, byte size and SHA256 of both `helper.exe` and the installer into the run summary. Verify a download with `Get-FileHash .\helper.exe -Algorithm SHA256` (or the installer's filename). |
 
 ### Smoke-testing without cutting a release
 
@@ -197,7 +288,22 @@ Like a real release, this needs the workflow to be on the default branch — `wo
 
 ### Code signing
 
-Not wired up yet — the published exe is unsigned, so SmartScreen may warn on first run ("More info" → "Run anyway"). There is a commented-out Azure Trusted Signing placeholder in [`.github/workflows/release.yml`](../.github/workflows/release.yml) for when we do it.
+Not wired up yet — the published exe **and** the installer that wraps it are both unsigned, so SmartScreen may warn on first run of either ("More info" → "Run anyway"). There is a commented-out Azure Trusted Signing placeholder in [`.github/workflows/release.yml`](../.github/workflows/release.yml) for when we do it — it signs `helper.exe` before the installer is built (so the installer never embeds an unsigned exe) and signs the installer again afterwards.
+
+**This is more than a SmartScreen warning.** During installer testing, Windows Defender's
+real-time protection deleted a freshly *launched* `helper.exe` outright, flagging it as
+`Trojan:Win32/Bearfoos.A!ml` — a well-documented machine-learning false positive that
+disproportionately hits statically-linked mingw-w64 binaries (exactly what `make static` /
+`dist-static/helper.exe` produces). The file at rest on disk wasn't touched; the detection fired
+on *execution*, which is also what happens when the installer's `[Run]` postinstall step launches
+the app at the end of setup — so a from-scratch install on a machine with default Defender
+settings can end with the exe silently deleted seconds after "successful" install. Signing both
+the exe and the installer is expected to fix this (a verified publisher identity is exactly what
+this class of ML heuristic is checking for) — until then, if a fresh install's tray icon
+disappears right after launch or Explorer shows the app "missing" post-install, check
+**Windows Security → Protection history** for a Bearfoos.A!ml (or similar) detection before
+assuming a build or install bug. See the Defender note in
+[`CLIENT-HANDOFF.md`](CLIENT-HANDOFF.md) for what to tell a client hitting this.
 
 ---
 
@@ -328,7 +434,7 @@ Only one app can stream from the dermoscope at a time on Windows. If anything el
 
 ### Service mode not supported
 
-`SendInput` only reaches the foreground window of the current interactive user session. Running the helper as a Windows service would break this. If you need auto-start, register it as a Startup-folder shortcut or a Task Scheduler task under the interactive user, not as a service. Shipping that as a feature — a "run at login" option and an installer — is a separate, later task; the tray build does not install or register itself.
+`SendInput` only reaches the foreground window of the current interactive user session. Running the helper as a Windows service would break this. Auto-start is a Startup-folder shortcut under the interactive user, not a service — which is exactly what the [installer](#install)'s "Start Dermoscope Helper when I sign in" option sets up. Running the bare exe manually (no installer) registers nothing; you'd have to make your own Startup-folder shortcut if you want the same effect.
 
 ### Preview and capture share one buffer
 
@@ -346,15 +452,23 @@ windows-helper/
 ├── helper.cpp         -- single-file implementation
 ├── helper.rc          -- Win32 resources: version info + app icon (ID 101)
 ├── assets/
-│   └── helper.ico     -- app icon, resource ID 101 (tracked source, not build output)
+│   ├── helper.ico          -- app icon, resource ID 101 (tracked source, not build output)
+│   ├── helper.png          -- 256px PNG render of the same icon, for docs/installer wizard images
+│   ├── make-helper-icon.py -- regenerates helper.ico/helper.png (stdlib-only, no Pillow)
+│   └── ICON-LICENSE.txt    -- icon provenance: original artwork, no third-party assets used
+├── installer/
+│   ├── helper.iss     -- Inno Setup 6 script, built by `make installer`
+│   └── README.md      -- how the installer is built and structured, and why
 ├── build/             -- intermediate objects incl. windres output    [git-ignored]
 ├── dist/              -- shared-build output (`make shared`)          [git-ignored]
 │   ├── helper.exe
 │   ├── libstdc++-6.dll
 │   ├── libgcc_s_seh-1.dll
 │   └── libwinpthread-1.dll
-└── dist-static/       -- static-build output (`make static`)          [git-ignored]
-    └── helper.exe
+├── dist-static/       -- static-build output (`make static`)          [git-ignored]
+│   └── helper.exe
+└── dist-installer/    -- installer output (`make installer`)          [git-ignored]
+    └── DermoscopeHelper-Setup-X.Y.Z.exe
 ```
 
 At runtime, tray mode writes `helper.log` (and, after a rotation, `helper.log.1`) next to `helper.exe` itself — the exe's own folder, not the current working directory.

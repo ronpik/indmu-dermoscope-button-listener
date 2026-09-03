@@ -80,6 +80,11 @@ static int g_port = 8080;
 
 // ---- Tray / window constants ----
 #define TRAY_WND_CLASS   L"DermoscopeHelperTrayWnd"
+// Single-instance mutex name. windows-helper/installer/helper.iss mirrors
+// this exact name in its AppMutex directive so the installer can detect (and
+// prompt to close) a running helper before install/uninstall -- if you
+// rename this, rename it there too or the two will silently drift apart.
+#define SINGLE_INSTANCE_MUTEX_NAME L"Local\\DermoscopeHelperSingleInstance"
 #define WM_TRAYICON      (WM_APP + 1)
 // Posted by the accept thread when the listening socket dies for good, so the
 // UI thread (the only thread allowed to touch the tray) can tell the truth.
@@ -1441,7 +1446,7 @@ int main(int argc, char **argv) {
     g_wmAlreadyRunning = RegisterWindowMessageW(L"DermoscopeHelperAlreadyRunning");
 
     // Single instance. Local\ is right: SendInput is per-session anyway.
-    HANDLE hMutex = CreateMutexW(NULL, TRUE, L"Local\\DermoscopeHelperSingleInstance");
+    HANDLE hMutex = CreateMutexW(NULL, TRUE, SINGLE_INSTANCE_MUTEX_NAME);
     if (hMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND other = FindWindowExW(HWND_MESSAGE, NULL, TRAY_WND_CLASS, NULL);
         if (other) PostMessageW(other, g_wmAlreadyRunning, 0, 0);

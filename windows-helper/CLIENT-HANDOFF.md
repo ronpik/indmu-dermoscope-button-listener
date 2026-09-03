@@ -6,41 +6,54 @@ What to send to the clinician's workstation (or QA / pilot user) to run the help
 
 ## What to send
 
-**One file:** `helper.exe` (~3.4 MB, no dependencies), downloaded from the repo's Releases page:
+**One file:** `DermoscopeHelper-Setup-<version>.exe` (the installer), downloaded from the repo's Releases page:
 
 **https://github.com/ronpik/indmu-dermoscope-button-listener/releases/latest**
 
-The asset is named exactly `helper.exe` — that name is stable across releases, so docs and client-side instructions can hard-code it. `helper-<version>-windows-x64.zip` is attached alongside it for people whose browser or antivirus blocks a bare `.exe` download; unzip it and you have the identical binary. Send the client a link to the release rather than emailing the exe, if you can — mail gateways strip executables.
+Send the client a link to the release rather than emailing the exe, if you can — mail gateways strip executables. This is a per-user installer: no admin rights needed, no UAC prompt, and it leaves the client with a normal Start Menu entry and uninstaller instead of a loose exe they have to remember where they put.
 
-The release asset is the **static** build (`make static`). Single self-contained Windows executable — no DLLs, no installer, no admin rights, no Visual C++ Redistributable required. Links against only inbox Windows DLLs (`kernel32`, `user32`, `ole32`, `oleaut32`, `ws2_32`, `quartz`, `qedit`), all present on every Windows 10/11 install.
-
-**Checksum.** The release workflow prints the SHA256 of the published `helper.exe` into its run summary (Actions → the `Release` run for that tag). To confirm the client got the right file:
+**Checksum.** The release workflow prints the SHA256 of both the installer and `helper.exe` into its run summary (Actions → the `Release` run for that tag). To confirm the client got the right file:
 
 ```powershell
-Get-FileHash .\helper.exe -Algorithm SHA256
+Get-FileHash .\DermoscopeHelper-Setup-<version>.exe -Algorithm SHA256
 ```
 
-**Not code-signed yet.** There is no Authenticode signature on the exe, so Windows SmartScreen may show "Windows protected your PC" the first time it runs — the user clicks **More info** → **Run anyway**. The exe does carry version metadata (company `Indmu`, description `Dermoscope Helper`, file/product version — visible under Properties → Details), which makes it look less anonymous and helps some reputation heuristics, but it is not a substitute for signing. Warn the client about this before they open the file.
+**Not code-signed yet.** There is no Authenticode signature on the installer or the `helper.exe` it installs, so Windows SmartScreen may show "Windows protected your PC" the first time either one runs — the user clicks **More info** → **Run anyway**. The exe does carry version metadata (company `Indmu`, description `Dermoscope Helper`, file/product version — visible under Properties → Details), which makes it look less anonymous and helps some reputation heuristics, but it is not a substitute for signing. Warn the client about this before they open either file.
 
-**Smaller, local-only alternative.** The shared build (`make shared` → `dist/helper.exe`, ~870 KB) needs three mingw runtime DLLs beside it (`libstdc++-6.dll`, `libgcc_s_seh-1.dll`, `libwinpthread-1.dll`), so you would have to send the whole `dist/` folder. It is never attached to a release. For a customer drop the single-file static build from the Releases page is the simpler experience.
+**Windows Defender may go further than a warning.** Because `helper.exe` is a statically-linked mingw-w64 binary, Windows Defender's real-time protection can flag it on execution as `Trojan:Win32/Bearfoos.A!ml` — a known machine-learning false positive for this kind of build, not an actual threat — and **delete the file**, not just warn about it. This was observed happening to a freshly-installed copy seconds after the installer's own end-of-setup launch, and again on a manual launch of the installed exe afterward. If a client reports the tray icon vanishing right after install, or Explorer showing the app missing, have them check **Windows Security → Protection history** before assuming the install failed — a `Bearfoos.A!ml` (or similarly-named) entry there confirms this, not a real infection.
+
+Until the exe is signed, tell the client to add an exclusion *before* installing (a detection that already fired can still have deleted the file even after the exclusion is added — see below):
+
+1. Open **Windows Security** (search it from the Start menu).
+2. **Virus & threat protection** → under "Virus & threat protection settings", click **Manage settings**.
+3. Scroll to **Exclusions** → **Add or remove exclusions** → **Add an exclusion** → **Folder**.
+4. Add `%LOCALAPPDATA%\Programs\Dermoscope Helper` (paste that literally into the folder picker's address bar — it expands to the real path).
+
+If the file was already deleted before the exclusion was added, either add the exclusion and reinstall, or open **Windows Security → Protection history**, find the detection, and choose **Actions → Restore** (then still add the exclusion, or the next run will just get flagged again). Code signing is expected to resolve this the same way it resolves SmartScreen, at which point this whole section goes away.
+
+**Alternative: the bare exe, no install.** For a portable drop — a one-off test box, or a client who'd rather not install anything — send `helper.exe` (~3.4 MB, no dependencies) instead, from the same release page. It's the identical static build the installer wraps: no DLLs, no installer, no admin rights, no Visual C++ Redistributable. `helper-<version>-windows-x64.zip` (same binary, zipped) is attached alongside it for people whose browser or antivirus blocks a bare `.exe` download. Links against only inbox Windows DLLs (`kernel32`, `user32`, `ole32`, `oleaut32`, `ws2_32`, `quartz`, `qedit`), all present on every Windows 10/11 install. This is the right choice when there's no interest in a Start Menu entry, an uninstaller, or auto-start at sign-in — just double-click and go, covered in the bare-exe steps in [`README.md`](README.md#quick-start-end-user-on-a-fresh-windows-machine).
+
+The shared build (`make shared` → `dist/helper.exe`, ~870 KB) needs three mingw runtime DLLs beside it, so it's never a good handoff pick and is never attached to a release — mentioned here only so you don't go looking for it.
 
 ---
 
 ## What the client does
 
-1. Plug the dermoscope into a USB port.
-2. Double-click `helper.exe`. On the very first run SmartScreen may interrupt: **More info** → **Run anyway** (see "What to send" — the exe is not signed yet). A console window then flashes briefly and vanishes — that is expected; the helper detaches it and keeps running in the background. An icon appears in the system tray (notification area), capture starts on its own, and a balloon reports the result.
+1. Download `DermoscopeHelper-Setup-<version>.exe` and run it. On first run SmartScreen may interrupt: **More info** → **Run anyway** (see "What to send" — it's not signed yet).
+2. Click through the wizard — no admin prompt appears. The two checkboxes it shows are already set sensibly for a clinic workstation: **desktop shortcut** is off, **"Start Dermoscope Helper when I sign in"** is on. The client can change either before clicking Install.
+3. At the end of setup, "Launch Dermoscope Helper" is checked by default — leave it, and the helper starts right there. An icon appears in the system tray (notification area), capture starts on its own, and a balloon reports the result.
    - **Windows 11 hides new tray icons by default.** The first time, look in the overflow flyout behind the `^` chevron on the taskbar. Drag the icon onto the taskbar to pin it.
-   - To get the old foreground-in-a-terminal behaviour instead — the terminal keeps the log visible, which helps diagnose issues — run `helper.exe --console`.
-3. Open `http://localhost:8080/` in a browser — the built-in test page shows live preview. (Right-click the tray icon → **Open test page** does the same thing.) Press the hardware button on the dermoscope → full-res capture appears in the canvas on the right. That's the smoke test.
-4. If it works, point the production web app at `http://localhost:8080/preview` and `http://localhost:8080/still`.
-5. When finished, right-click the tray icon → **Exit**. That is how you quit the helper and release the camera for other apps — there is no window to close.
+4. Open `http://localhost:8080/` in a browser — the built-in test page shows live preview. (Right-click the tray icon → **Open test page** does the same thing.) Press the hardware button on the dermoscope → full-res capture appears in the canvas on the right. That's the smoke test.
+5. If it works, point the production web app at `http://localhost:8080/preview` and `http://localhost:8080/still`.
+6. When finished, right-click the tray icon → **Exit**. That is how you quit the helper and release the camera for other apps — there is no window to close. Because "start at sign-in" is on by default, it'll be back in the tray next time the client logs in, with no need to launch it by hand.
 
 Right-clicking the tray icon gives four commands: **Start**, **Stop**, **Open test page**, **Exit**. Left double-click toggles Start / Stop. Hover the icon for a tooltip showing the current state (`running`, `stopped`, `device not found`, `camera busy`, `error`).
 
-The log goes to `helper.log`, in the same folder as `helper.exe`. That is the first place to look if anything misbehaves. To get the old foreground-in-a-terminal behaviour with the log on stderr instead, run `helper.exe --console`.
+The log goes to `helper.log`, in the same folder the installer put the exe (`%LOCALAPPDATA%\Programs\Dermoscope Helper`) — that is the first place to look if anything misbehaves. To get the old foreground-in-a-terminal behaviour with the log on stderr instead, run the installed `helper.exe --console` from that folder.
 
-No admin rights, no driver install, no firewall prompt (loopback-only bind to `127.0.0.1`). Only one copy runs at a time — launching a second `helper.exe` exits immediately and the running one shows a balloon saying so.
+No admin rights, no driver install, no firewall prompt (loopback-only bind to `127.0.0.1`). Only one copy runs at a time — launching a second `helper.exe` exits immediately and the running one shows a balloon saying so; Setup itself will also notice a running helper and ask to close it before installing or uninstalling.
+
+**Uninstalling:** **Settings → Apps → Installed apps → Dermoscope Helper → Uninstall**, or the "Uninstall Dermoscope Helper" entry in its Start Menu group. This removes the exe, both shortcuts, the Startup-folder entry, and `helper.log` / `helper.log.1` — nothing is left behind.
 
 ---
 
@@ -92,7 +105,9 @@ Both endpoints send `Access-Control-Allow-Origin: *`, so cross-origin from any w
 
 ## How to verify before sending
 
-**Normal path — check the released exe.** Download `helper.exe` from the [latest release](https://github.com/ronpik/indmu-dermoscope-button-listener/releases/latest), compare `Get-FileHash .\helper.exe -Algorithm SHA256` against the SHA256 in that release's workflow run summary, then run it on a Windows box with the dermoscope plugged in:
+**Normal path — check the released installer.** Download `DermoscopeHelper-Setup-<version>.exe` from the [latest release](https://github.com/ronpik/indmu-dermoscope-button-listener/releases/latest), compare `Get-FileHash .\DermoscopeHelper-Setup-<version>.exe -Algorithm SHA256` against the SHA256 in that release's workflow run summary, then run it end to end on a Windows box with the dermoscope plugged in: run the installer, let it launch the helper at the end, open `http://localhost:8080/` in a browser, press the hardware button, confirm the capture shows up in the canvas. Then uninstall it (**Settings → Apps → Installed apps → Dermoscope Helper**) and confirm the exe, shortcuts, Startup entry, and `helper.log*` are all gone.
+
+Also spot-check the bare `helper.exe` from the same release the same way it's used standalone:
 
 ```powershell
 .\helper.exe 8080
@@ -110,6 +125,9 @@ make static                        # builds dist-static/helper.exe
 # --console keeps the log on stderr where you can watch it. Open
 # http://localhost:8080/ in a browser, press the hardware button, confirm the
 # capture shows up in the canvas. Ctrl-C exits cleanly and releases the camera.
+
+make installer VERSION=0.0.1-dev   # needs ISCC -- see README.md's "Building the installer" section
+# -> dist-installer/DermoscopeHelper-Setup-0.0.1-dev.exe -- run it to test the install flow itself.
 ```
 
 Verify the shipping (tray) behaviour too: double-click `dist-static/helper.exe`, confirm the tray icon appears and the balloon says it is running, then right-click → **Exit** and confirm the camera is free afterwards (the Windows Camera app should open the dermoscope).
