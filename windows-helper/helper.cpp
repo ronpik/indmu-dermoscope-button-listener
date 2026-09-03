@@ -555,11 +555,10 @@ static std::mutex g_clientMu;
 static std::set<SOCKET> g_clientSocks;
 static std::atomic<int> g_clientThreads{0};
 
-// Sending every 1600x1200 JPEG to every viewer multiplies bandwidth by the
-// number of open tabs. The test page plus the clinical app can otherwise push
-// a 100 Mbps link into backpressure and trip the per-socket send timeout. Keep
-// the aggregate preview rate close to one full-rate stream by sharing frame
-// opportunities across all active preview clients (see /preview below).
+// Track active preview viewers for /health and diagnostics. Every viewer gets
+// every published frame: reducing each viewer's cadence when another tab opens
+// makes the clinical preview visibly choppy. Slow viewers remain isolated in
+// their own client thread and catch up from g_latestPreview after a send.
 static std::mutex g_previewClientMu;
 static std::set<unsigned long long> g_previewClientIds;
 static std::atomic<unsigned long long> g_nextPreviewClientId{1};
@@ -573,25 +572,6 @@ static void reset_preview_clients() {
     std::lock_guard<std::mutex> lk(g_previewClientMu);
     g_previewClientIds.clear();
 }
-
-static constexpr bool preview_sequence_is_assigned(
-    unsigned long long sequence,
-    unsigned long long clientCount,
-    unsigned long long slot) {
-    return clientCount <= 1 || sequence % clientCount == slot;
-}
-
-static_assert(preview_sequence_is_assigned(7, 1, 0),
-              "A sole preview client must receive every frame");
-static_assert(preview_sequence_is_assigned(8, 2, 0) &&
-              !preview_sequence_is_assigned(8, 2, 1) &&
-              !preview_sequence_is_assigned(9, 2, 0) &&
-              preview_sequence_is_assigned(9, 2, 1),
-              "Two preview clients must alternate frames");
-static_assert(preview_sequence_is_assigned(8, 3, 2) &&
-              preview_sequence_is_assigned(9, 3, 0) &&
-              preview_sequence_is_assigned(10, 3, 1),
-              "Preview scheduling must round-robin across three clients");
 
 class PreviewClientRegistration {
 public:
@@ -607,20 +587,6 @@ public:
     }
 
     unsigned long long generation() const { return generation_; }
-
-    bool should_send(long long sequence) const {
-        std::lock_guard<std::mutex> lk(g_previewClientMu);
-        auto mine = g_previewClientIds.find(id_);
-        if (mine == g_previewClientIds.end()) return false;
-
-        size_t slot = 0;
-        for (auto it = g_previewClientIds.begin(); it != mine; ++it) ++slot;
-        size_t count = g_previewClientIds.size();
-        return preview_sequence_is_assigned(
-            (unsigned long long)sequence,
-            (unsigned long long)count,
-            (unsigned long long)slot);
-    }
 
     PreviewClientRegistration(const PreviewClientRegistration&) = delete;
     PreviewClientRegistration& operator=(
@@ -732,14 +698,6 @@ static void handle_client(SOCKET sock) {
                 if (g_previewSeq.load() == lastSeq) continue;
                 currentSeq = g_previewSeq.load();
                 lastSeq = currentSeq;
-
-                // One camera stream is already roughly 50 Mbps at the real
-                // 1600x1200 frame sizes. Assign each captured frame to one of
-                // the N viewers in round-robin order. Every viewer remains
-                // live, sends are staggered instead of bursty, and aggregate
-                // network traffic stays near the single-viewer rate. We copy
-                // only frames assigned to this client.
-                if (!previewClient.should_send(currentSeq)) continue;
                 frame = g_latestPreview;
             }
             // Never emit a zero-byte part, and skip anything that isn't a JPEG:
