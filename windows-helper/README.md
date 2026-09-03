@@ -99,7 +99,7 @@ you want a Start Menu entry, an uninstaller, and auto-start at sign-in, use the
 5. Press the dermoscope button → browser (if focused) receives `F9` → fetches `/still` → displays the full-res capture.
 6. When you're done, right-click the tray icon → **Exit**. That releases the camera for other apps.
 
-No admin rights, no driver install, no firewall prompt (loopback-only bind).
+No admin rights, no driver install. The server binds to all interfaces (`INADDR_ANY`) so it's reachable from other machines on the network, not just loopback — Windows Firewall will likely prompt to allow access the first time it runs.
 
 If you want the old foreground-in-a-terminal behaviour with the log on stderr, run `helper.exe --console` — see [Runtime usage](#runtime-usage).
 
@@ -337,9 +337,9 @@ Only one helper runs at a time. Launching a second `helper.exe` exits immediatel
 
 ## HTTP API (for integrating a real web app)
 
-All endpoints are under `http://localhost:<port>/` and bound to the loopback interface only, so other machines on the network cannot reach them.
+All endpoints are under `http://localhost:<port>/`, and also reachable at `http://<this machine's LAN IP>:<port>/` — the server binds to all interfaces (`INADDR_ANY`), not just loopback, so other machines on the network can reach them too.
 
-> **What the loopback bind does and does not protect.** It stops *other machines*, not *other websites*. Every endpoint sends `Access-Control-Allow-Origin: *`, so while the helper is running, any web page open in any browser on that same machine can stream `/preview` and fetch `/still` cross-origin — including a third-party ad iframe on an unrelated page. In practice that means the dermoscope's live video is readable by local software and by any site the user happens to have open, for as long as the helper is running. The tray **Stop** and **Exit** commands close the port as well as releasing the camera, which is the mitigation available today. Tightening this (an `Origin` allowlist, or a token in the URL) would change the HTTP contract, so it is a deliberate decision for the integrating team rather than something the helper decides.
+> **There is no access control beyond the network itself.** Every endpoint sends `Access-Control-Allow-Origin: *`, so any web page open in any browser that can reach the helper's port — on this machine, or on any other machine on the same network — can stream `/preview` and fetch `/still` cross-origin, with no authentication and no per-origin restriction. That includes a third-party ad iframe on an unrelated page, or any device on the LAN, deliberately or not. In practice the dermoscope's live video is readable by anything that can route to this host and port, for as long as the helper is running. The tray **Stop** and **Exit** commands close the port as well as releasing the camera, and Windows Firewall (or restricting the network the machine is on) is the other mitigation available today. Tightening this (an `Origin` allowlist, a token in the URL, or binding back to loopback with a reverse proxy for the cases that need LAN access) would change the HTTP contract, so it is a deliberate decision for the integrating team rather than something the helper decides.
 
 ### `GET /preview`
 

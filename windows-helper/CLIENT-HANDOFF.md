@@ -51,7 +51,7 @@ Right-clicking the tray icon gives four commands: **Start**, **Stop**, **Open te
 
 The log goes to `helper.log`, in the same folder the installer put the exe (`%LOCALAPPDATA%\Programs\Dermoscope Helper`) — that is the first place to look if anything misbehaves. To get the old foreground-in-a-terminal behaviour with the log on stderr instead, run the installed `helper.exe --console` from that folder.
 
-No admin rights, no driver install, no firewall prompt (loopback-only bind to `127.0.0.1`). Only one copy runs at a time — launching a second `helper.exe` exits immediately and the running one shows a balloon saying so; Setup itself will also notice a running helper and ask to close it before installing or uninstalling.
+No admin rights, no driver install. The server listens on all network interfaces, not just `127.0.0.1`, so it's reachable from other machines on the network — Windows Firewall will likely prompt to allow access the first time it runs. Only one copy runs at a time — launching a second `helper.exe` exits immediately and the running one shows a balloon saying so; Setup itself will also notice a running helper and ask to close it before installing or uninstalling.
 
 **Uninstalling:** **Settings → Apps → Installed apps → Dermoscope Helper → Uninstall**, or the "Uninstall Dermoscope Helper" entry in its Start Menu group. This removes the exe, both shortcuts, the Startup-folder entry, and `helper.log` / `helper.log.1` — nothing is left behind.
 
