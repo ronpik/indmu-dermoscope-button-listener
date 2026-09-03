@@ -476,6 +476,13 @@ static void handle_client(SOCKET sock) {
     char method[16] = {0}, path[256] = {0};
     sscanf(buf, "%15s %255s", method, path);
 
+    // Strip a query string before routing: none of our endpoints take
+    // parameters, and callers commonly append one anyway as a cache-buster
+    // (e.g. "/preview?t=123" to force a browser to re-open the stream).
+    // Without this every such request 404s.
+    char *query = strchr(path, '?');
+    if (query) *query = '\0';
+
     if (strcmp(path, "/") == 0 || strcmp(path, "/index.html") == 0) {
         char hdr[256];
         int hlen = snprintf(hdr, sizeof(hdr),

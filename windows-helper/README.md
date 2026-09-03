@@ -88,7 +88,7 @@ The helper has no window; everything lives on the tray icon. (The icon appears i
 
 The icon graphic is the app's own icon when the executable carries one (resource `101`) and a stock Windows icon otherwise; a build may additionally grey the icon out while the helper isn't running. Either way, read the tooltip for the real state.
 
-**Stop and Exit normally release the camera straight afterwards.** The DirectShow graph is torn down and every device handle is released, so the Windows Camera app — or a browser tab doing `getUserMedia`, or anything else — can open the dermoscope. Nothing needs to be unplugged. Teardown takes a few seconds (the tray menu is unresponsive while it runs), so give it a moment before starting the other app. Teardown can also fail: if a wedged USB driver refuses to stop the graph, the helper logs a `WARNING: graph ... may not have been released` line. If a later app still reports the camera as busy, check `helper.log` for that warning.
+**Stop and Exit normally release the camera straight afterwards.** The DirectShow graph is torn down and every device handle is released, so the Windows Camera app — or a browser tab doing `getUserMedia`, or anything else — can open the dermoscope. Nothing needs to be unplugged. Teardown takes a few seconds (the tray menu is unresponsive while it runs), so give it a moment before starting the other app. Teardown can also fail: if a wedged USB driver refuses to stop the graph, the helper logs a `WARNING: graph ... may not have been released` line. If a later app still reports the camera as busy, check `helper.log` for that warning. If a web app is consuming `/preview` while you Stop and Start, its `<img>` will freeze silently with no error — see [Recovering from a Stop/Start cycle](#recovering-from-a-stopstart-cycle).
 
 ---
 
@@ -177,6 +177,8 @@ Browser support is universal. You can also read the same URL with `fetch()` and 
 
 Response headers include `Access-Control-Allow-Origin: *` so the endpoint can be consumed from any origin.
 
+Query strings on any endpoint are accepted and ignored (stripped before routing), so the common cache-busting pattern `/preview?t=${Date.now()}` works as expected — see "Recovering from a Stop/Start cycle" below for why you'd want that.
+
 ### `GET /still`
 
 Returns the **most recent full-resolution JPEG** snapshot — a copy of the preview frame that was live at the moment the user pressed the hardware button. Content type is `image/jpeg`. Resolution matches the preview (1600×1200 unless you've edited the source). If no button has been pressed yet, returns `404`.
@@ -238,6 +240,38 @@ Minimum integration — add two things to the web app that currently uses `getUs
 3. **Put "clear / undo / re-take" in the web app's own UI.** Those gestures used to be bound to double/triple-click on the hardware button; on the HT-B30S that turned out to be mechanically unreliable (see [`../docs/NEXT-SESSION.md`](../docs/NEXT-SESSION.md) for the full post-mortem). UI buttons or keyboard shortcuts are the right home.
 
 For reference, `helper.cpp`'s embedded `INDEX_HTML` string is a complete working example.
+
+### Recovering from a Stop/Start cycle
+
+The clinician can Stop and Start the camera at any time from the tray menu — a browser tab
+does not need to be involved for that to happen. When the helper stops, an `<img>` already
+pointed at `/preview` **freezes on its last frame and gives no signal that anything went
+wrong**: `naturalWidth`/`naturalHeight` and `img.complete` stay exactly as they were, and
+neither a `load` nor an `error` event fires. This is standard browser behaviour for
+`multipart/x-mixed-replace` — a stream that quietly ends looks identical to one that is
+merely idle between frames. `onerror` is **not** a usable signal here.
+
+The reliable way to detect it is to poll an endpoint that only responds while the server is
+up, e.g. `GET /`. When it starts responding again after having failed, re-request `/preview`
+to reconnect — reusing the existing `<img>`'s `src` will not reconnect a stalled stream, so
+either append a cache-busting query string (query strings are stripped server-side, see
+above, so `/preview?t=...` is safe) or clear `src` before reassigning it:
+
+```js
+const img = document.getElementById('preview');
+let wasUp = true;
+setInterval(async () => {
+  const isUp = await fetch('http://localhost:8080/', { cache: 'no-store' })
+                      .then(r => r.ok).catch(() => false);
+  if (isUp && !wasUp) {
+    img.src = 'http://localhost:8080/preview?t=' + Date.now();  // force a fresh connection
+  }
+  wasUp = isUp;
+}, 3000);
+```
+
+This is unrelated to the F9/`/still` capture path, which is stateless per request and needs
+no such handling — a `fetch('/still')` issued while the server is stopped simply rejects.
 
 ### Mixed-content caveat
 
