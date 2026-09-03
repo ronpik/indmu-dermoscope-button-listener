@@ -74,6 +74,8 @@ coverage.html
 windows-helper/dist/
 # `make static` output (single self-contained exe)
 windows-helper/dist-static/
+# `make installer` output (Inno Setup per-user installer exe)
+windows-helper/dist-installer/
 # intermediate objects, including the windres-compiled resource object
 windows-helper/build/
 

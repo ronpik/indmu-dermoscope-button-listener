@@ -5,13 +5,23 @@
 #   make shared   -> dist/helper.exe + runtime DLLs in dist/ (small exe, 3 DLLs alongside)
 #   make static   -> dist-static/helper.exe  (single fat exe, no external DLLs)
 #   make all      -> both of the above (default)
-#   make clean    -> remove both dist dirs and build/
+#   make clean    -> remove both dist dirs, dist-installer/ and build/
+#
+# Installer (per-user, no admin required):
+#   make installer VERSION=1.2.3   builds the static exe, then packages it with
+#                                   Inno Setup into
+#                                   dist-installer/DermoscopeHelper-Setup-1.2.3.exe
+#   Needs ISCC (the Inno Setup 6 command-line compiler) — see the ISCC variable
+#   and the check-iscc target below for how it's located and what to do if it
+#   isn't installed.
 #
 # Versioning:
 #   make static VERSION=1.2.3   stamps the exe with that version + the app icon
 #   VERSION defaults to 0.0.0. Release tags are vX.Y.Z; pass the tag WITHOUT
 #   the leading "v". A pre-release suffix (1.2.3-rc1) is fine — it is kept in
 #   the displayed version string and stripped from the numeric fields.
+#   `make installer` stamps and names the Setup exe with this same cleaned
+#   version (see VER_CLEAN), so the two can never disagree.
 #
 # Output layouts:
 #   dist/
@@ -22,6 +32,10 @@
 #
 #   dist-static/
 #     helper.exe                 (~3.4 MB, no external deps — drop anywhere)
+#
+#   dist-installer/
+#     DermoscopeHelper-Setup-X.Y.Z.exe   (per-user Inno Setup installer, wraps
+#                                          the dist-static/ exe above)
 
 CXX       ?= g++
 CXXFLAGS  ?= -O2 -Wall -std=c++17
@@ -73,16 +87,38 @@ export TEMP   := $(TMPDIR)
 MINGW_BIN ?= /mingw64/bin
 RUNTIME_DLLS := libstdc++-6.dll libgcc_s_seh-1.dll libwinpthread-1.dll
 
-DIST_SHARED  := dist
-DIST_STATIC  := dist-static
+DIST_SHARED    := dist
+DIST_STATIC    := dist-static
+DIST_INSTALLER := dist-installer
 
-.PHONY: all shared static clean check-toolchain FORCE
+# --- Inno Setup compiler location ---
+# The GitHub windows-latest runners already have ISCC on PATH, so prefer that;
+# a developer machine typically doesn't, so fall back to Inno Setup 6's default
+# install location. Either way this is just the *default* — an explicit
+# `make installer ISCC=/some/path/ISCC.exe` on the command line (or in the
+# environment) always wins, because ?= only assigns when ISCC is still unset.
+# $(shell ...) here is lazy (?= makes ISCC recursively-expanded), so this probe
+# only runs when a target actually uses $(ISCC), not on every `make` invocation.
+ISCC_DEFAULT := C:/Program Files (x86)/Inno Setup 6/ISCC.exe
+ISCC         ?= $(if $(shell command -v iscc 2>/dev/null),iscc,$(ISCC_DEFAULT))
+ISS          := installer/helper.iss
+
+.PHONY: all shared static installer clean check-toolchain check-iscc FORCE
 
 all: shared static
 
 check-toolchain:
 	@command -v $(CXX) >/dev/null 2>&1 || { echo "ERROR: $(CXX) not found on PATH. Open an MSYS2 MINGW64 shell and install: pacman -S mingw-w64-x86_64-gcc"; exit 1; }
 	@command -v $(WINDRES) >/dev/null 2>&1 || { echo "ERROR: $(WINDRES) not found on PATH. Open an MSYS2 MINGW64 shell and install: pacman -S mingw-w64-x86_64-binutils"; exit 1; }
+
+check-iscc:
+	@command -v "$(ISCC)" >/dev/null 2>&1 || { \
+	  echo "ERROR: Inno Setup's ISCC compiler not found (looked for 'iscc' on PATH and at '$(ISCC_DEFAULT)')."; \
+	  echo "Install it with:  winget install JRSoftware.InnoSetup"; \
+	  echo "or download it from: https://jrsoftware.org/isdl.php"; \
+	  echo "Installed somewhere else? Point make at it: make installer ISCC=/path/to/ISCC.exe"; \
+	  exit 1; \
+	}
 
 # --- Resource object: app icon (IDI_APP == 101) + VERSIONINFO ---
 # VERSION is a make variable, not a file, so it cannot be a prerequisite
@@ -133,15 +169,39 @@ $(DIST_STATIC)/helper.exe: $(SRC) $(RES_OBJ) | $(DIST_STATIC)
 $(DIST_STATIC):
 	mkdir -p $(DIST_STATIC)
 
+# --- Installer: per-user Inno Setup package wrapping the static exe ---
+# helper.iss lives in installer/ and its own OutputDir is "..\dist-installer"
+# — a path relative to the .iss file, not to make's cwd. Since ISS below is
+# given to ISCC as "installer/helper.iss" (relative to this Makefile, i.e.
+# windows-helper/), that resolves to windows-helper/dist-installer/ regardless
+# of where make itself was invoked from. DIST_INSTALLER must keep matching
+# that OutputDir, or the ls/echo below will look in the wrong place.
+#
+# MSYS2_ARG_CONV_EXCL='*': ISCC.exe is a native Windows program that takes
+# Windows-style "/Dname=value" flags, not MSYS-style "-D". MSYS2's runtime
+# auto-converts arguments that look like POSIX paths before handing them to a
+# non-MSYS executable, and a leading "/" is exactly what that heuristic looks
+# for -- so "/DVERSION=0.0.1" gets silently mangled and ISCC sees garbage
+# ("You may not specify more than one script filename."). Disabling the
+# conversion for this one recipe (rather than exporting it Makefile-wide)
+# keeps the workaround scoped to the single command that actually needs it.
+installer: check-iscc static
+	MSYS2_ARG_CONV_EXCL='*' "$(ISCC)" /DVERSION=$(VER_CLEAN) $(ISS)
+	@echo ""
+	@echo "Installer ready:"
+	@ls -la $(DIST_INSTALLER)/DermoscopeHelper-Setup-$(VER_CLEAN).exe
+	@echo ""
+	@echo "Ship $(DIST_INSTALLER)/DermoscopeHelper-Setup-$(VER_CLEAN).exe — that's the one users run."
+
 # Windows keeps a running helper.exe's image locked (AV scanners hold brief
 # locks too), which makes a first rm fail. Retry once before giving up — the
 # second rm is unguarded so a genuinely stuck file still fails loudly rather
 # than leaving stale output behind under a "successful" clean.
 clean:
-	@rm -rf $(DIST_SHARED) $(DIST_STATIC) $(BUILD_DIR) 2>/dev/null || { \
+	@rm -rf $(DIST_SHARED) $(DIST_STATIC) $(DIST_INSTALLER) $(BUILD_DIR) 2>/dev/null || { \
 	  echo "clean: a build output is locked (is helper.exe still running?); retrying..."; \
 	  sleep 1; \
-	  rm -rf $(DIST_SHARED) $(DIST_STATIC) $(BUILD_DIR); \
+	  rm -rf $(DIST_SHARED) $(DIST_STATIC) $(DIST_INSTALLER) $(BUILD_DIR); \
 	}
 
 # --- Quick-run helpers (no real dependency tracking; rebuild + run) ---

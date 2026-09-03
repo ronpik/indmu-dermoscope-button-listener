@@ -1,24 +1,26 @@
 # Release
 #
 # Builds the Windows dermoscope helper (windows-helper/helper.cpp) with mingw-w64
-# inside an MSYS2 MINGW64 shell -- the same `make static` used locally -- and
-# publishes the single-file dist-static/helper.exe.
+# inside an MSYS2 MINGW64 shell -- the same `make static` used locally -- then
+# builds the per-user Inno Setup installer on top of it (`make installer`, which
+# shells out to ISCC) and publishes both.
 #
 # How it runs:
 #
 #   * Publishing a GitHub release tagged vX.Y.Z builds with VERSION=X.Y.Z (the
-#     leading "v" is stripped) and attaches two assets to that release:
-#     `helper.exe` (the stable name docs and clients depend on -- do not rename)
-#     and `helper-X.Y.Z-windows-x64.zip`.
+#     leading "v" is stripped) and attaches THREE assets to that release:
+#     `helper.exe` (the stable name docs and clients depend on -- do not rename),
+#     `helper-X.Y.Z-windows-x64.zip`, and `DermoscopeHelper-Setup-X.Y.Z.exe` (the
+#     installer -- an addition, not a replacement for the bare exe).
 #
 #   * Manual smoke test: Actions tab -> "Release" -> "Run workflow". The optional
 #     "version" input is stamped into the build and defaults to 0.0.0-dev.
-#     Manual runs never touch a release; the binary shows up as a downloadable
-#     run artifact instead.
+#     Manual runs never touch a release; helper.exe and the installer show up as
+#     a downloadable run artifact instead.
 #
 # The build always produces a run artifact, so a manual run exercises the whole
-# build and packaging path. The only step it does not reach is "Attach assets to
-# the release", which is gated on the release event.
+# build and packaging path, installer included. The only step it does not reach
+# is "Attach assets to the release", which is gated on the release event.
 #
 # Note: GitHub reads both triggers from the DEFAULT branch -- this file has to be
 # merged to `main` before "Run workflow" appears in the Actions tab or before
@@ -123,13 +125,23 @@ jobs:
       # ----------------------------------------------------------------------
       # PLACEHOLDER -- CODE SIGNING IS NOT SET UP YET.
       #
-      # Everything in this block is a YAML comment. It does not run, and none of
-      # the secrets below exist in this repository today. Released binaries are
-      # currently UNSIGNED and Windows SmartScreen will warn about them.
+      # Everything in this block (both placeholder steps -- this one and the
+      # second one below "Build installer (make installer)") is a YAML comment.
+      # Neither runs, and none of the secrets they name exist in this repository
+      # today. Released binaries -- and the installer that embeds one of them --
+      # are currently UNSIGNED and Windows SmartScreen will warn about both.
       #
-      # When a signing identity is available, uncomment the step and drop it in
-      # right here -- after the build, before the checksum and zip -- so that the
-      # checksum, the zip and the release asset all describe the *signed* exe.
+      # Signing order matters here because the installer EMBEDS helper.exe:
+      #   1. Build (make static)                    <- exists above
+      #   2. Sign helper.exe                         <- this placeholder
+      #   3. Ensure Inno Setup (ISCC) is available   <- exists below
+      #   4. Build installer (make installer)        <- exists below, packs the exe
+      #   5. Sign the installer                      <- second placeholder, below
+      #   6. Checksum and build summary / Package zip / Attach assets
+      # Signing helper.exe AFTER step 4 instead would ship an unsigned copy
+      # sealed inside a signed installer wrapper -- the wrapper's own signature
+      # says nothing about what it contains, so the inner exe must be signed
+      # first and the outer installer signed again once it exists.
       #
       # Secrets to create first (Settings -> Secrets and variables -> Actions):
       #   AZURE_TENANT_ID
@@ -149,13 +161,85 @@ jobs:
       #     files-folder-filter: exe
       # ----------------------------------------------------------------------
 
+      # windows-latest images ship Inno Setup 6 preinstalled, but that is a fact
+      # about today's runner image, not a guarantee -- image contents change
+      # under us between runs. Check for ISCC.exe at runtime and self-heal with
+      # choco rather than trusting the assumption blindly.
+      #
+      # This step overrides the job's `msys2 {0}` default and runs in `pwsh`
+      # instead. choco and "look up an exe the normal Windows way" are native
+      # Windows concerns: msys2/setup-msys2 deliberately gives the MINGW64 shell
+      # a minimal PATH (for reproducible builds), which hides both choco and a
+      # Program Files install from bash. pwsh sees the real Windows PATH, so
+      # `Get-Command` / `choco install` work here without fighting MSYS2's path
+      # translation. The resolved path is handed off via $GITHUB_ENV (converted
+      # to forward slashes) so the msys2 steps below can use it unchanged.
+      - name: Ensure Inno Setup (ISCC) is available
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $known = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          $cmd = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+          if ($cmd) {
+            $isccPath = $cmd.Source
+          } elseif (Test-Path $known) {
+            $isccPath = $known
+          } else {
+            Write-Host "ISCC.exe not found on this runner -- installing Inno Setup via choco."
+            choco install innosetup -y --no-progress
+            if (-not (Test-Path $known)) {
+              Write-Error "Inno Setup install did not produce $known"
+              exit 1
+            }
+            $isccPath = $known
+          }
+          Write-Host "Using ISCC at: $isccPath"
+          $isccUnix = $isccPath -replace '\\', '/'
+          Add-Content -Path $env:GITHUB_ENV -Value "ISCC_PATH=$isccUnix"
+
+      # ISCC_PATH is passed explicitly rather than leaning on the Makefile's own
+      # ISCC default: that default is a guess at Inno Setup's usual install
+      # location, whereas the pwsh step above actually resolved (or installed)
+      # ISCC.exe on this runner. Pass the real, confirmed path through instead
+      # of hoping the guess and reality still agree.
+      - name: Build installer (make installer)
+        working-directory: windows-helper
+        run: |
+          set -euo pipefail
+          make installer VERSION="$VERSION" ISCC="$ISCC_PATH"
+          ls -la dist-installer/
+          echo "INSTALLER_NAME=DermoscopeHelper-Setup-$VERSION.exe" >> "$GITHUB_ENV"
+
+      # ----------------------------------------------------------------------
+      # PLACEHOLDER -- see the numbered sequence in the signing note above the
+      # "Ensure Inno Setup (ISCC) is available" step for the full explanation.
+      # This is step 5 of that sequence: sign the installer itself, after it is
+      # built and before it is checksummed/attached. Still entirely commented
+      # out; no secrets exist yet.
+      #
+      # - name: Sign DermoscopeHelper-Setup.exe (Azure Trusted Signing)
+      #   uses: azure/trusted-signing-action@v0
+      #   with:
+      #     azure-tenant-id: <AZURE_TENANT_ID secret>
+      #     azure-client-id: <AZURE_CLIENT_ID secret>
+      #     azure-client-secret: <AZURE_CLIENT_SECRET secret>
+      #     endpoint: https://<region>.codesigning.azure.net/
+      #     trusted-signing-account-name: <account>
+      #     certificate-profile-name: <profile>
+      #     files-folder: <workspace>/windows-helper/dist-installer
+      #     files-folder-filter: exe
+      # ----------------------------------------------------------------------
+
       - name: Checksum and build summary
         working-directory: windows-helper
         run: |
           set -euo pipefail
           exe="dist-static/helper.exe"
+          installer="dist-installer/$INSTALLER_NAME"
           sha="$(sha256sum "$exe" | cut -d ' ' -f 1)"
           size="$(wc -c < "$exe" | tr -d '[:space:]')"
+          inst_sha="$(sha256sum "$installer" | cut -d ' ' -f 1)"
+          inst_size="$(wc -c < "$installer" | tr -d '[:space:]')"
           # $GITHUB_STEP_SUMMARY is a Windows-style path inside this shell, so
           # it must stay quoted when redirected to.
           {
@@ -167,6 +251,9 @@ jobs:
             echo "| file | \`helper.exe\` |"
             echo "| size | $size bytes |"
             echo "| sha256 | \`$sha\` |"
+            echo "| installer | \`$INSTALLER_NAME\` |"
+            echo "| installer size | $inst_size bytes |"
+            echo "| installer sha256 | \`$inst_sha\` |"
             echo ""
             echo "Unsigned build (code signing not configured yet)."
           } >> "$GITHUB_STEP_SUMMARY"
@@ -180,22 +267,29 @@ jobs:
           zip -j "dist-static/$zip_name" dist-static/helper.exe
           echo "ZIP_NAME=$zip_name" >> "$GITHUB_ENV"
 
-      # Unconditional: this is what makes a manual workflow_dispatch run useful.
-      # Only the bare exe goes in -- a run artifact is itself a zip, so adding the
-      # release zip would hand the downloader a zip inside a near-identically
-      # named zip.
+      # Unconditional: this is what makes a manual workflow_dispatch run useful,
+      # and now it exercises the installer path too, not just the bare exe.
+      # helper.exe and the installer both go in as-is -- neither is a zip, so
+      # there's no nesting concern. The release zip (helper-X.Y.Z-windows-
+      # x64.zip) is deliberately left OUT: a run artifact is itself a zip, and
+      # adding an already-zipped file would hand the downloader a zip inside a
+      # near-identically named zip.
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
         with:
           name: helper-${{ env.VERSION }}-windows-x64
-          path: windows-helper/dist-static/helper.exe
+          path: |
+            windows-helper/dist-static/helper.exe
+            windows-helper/dist-installer/${{ env.INSTALLER_NAME }}
           if-no-files-found: error
 
       # Release events only -- a manual run has no release to attach to.
-      # The first asset keeps the exact name `helper.exe`.
+      # The first asset keeps the exact name `helper.exe`. The installer is an
+      # ADDITION alongside the bare exe and the zip, never a replacement for
+      # either -- all three ship on every release.
       # fail_on_unmatched_files defaults to false: without it, an unresolved
-      # ZIP_NAME would silently publish a release with a missing asset and a
-      # green run.
+      # ZIP_NAME or a missing installer build would silently publish a release
+      # with a missing asset and a green run.
       - name: Attach assets to the release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v3
@@ -204,3 +298,4 @@ jobs:
           files: |
             windows-helper/dist-static/helper.exe
             windows-helper/dist-static/${{ env.ZIP_NAME }}
+            windows-helper/dist-installer/${{ env.INSTALLER_NAME }}
