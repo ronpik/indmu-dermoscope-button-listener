@@ -410,7 +410,8 @@ static const char INDEX_HTML[] =
 "<h1>Dermoscope helper - test page</h1>\n"
 "<p>Press the hardware button (or F9) to capture a full-res still from <code>/still</code>.</p>\n"
 "<div class=\"row\">\n"
-"  <div class=\"col\"><h2>Live preview</h2><img id=\"live\" src=\"/preview\" /></div>\n"
+"  <div class=\"col\"><h2>Live preview</h2><img id=\"live\" src=\"/preview\" />\n"
+"    <div id=\"liveStatus\" style=\"font-family: monospace; font-size: 0.85em; color: #888; margin-top: 4px;\"></div></div>\n"
 "  <div class=\"col\"><h2>Last capture</h2><canvas id=\"captured\"></canvas>\n"
 "    <div><button id=\"clear\">Clear</button></div></div>\n"
 "</div>\n"
@@ -442,6 +443,23 @@ static const char INDEX_HTML[] =
 "  if (e.key === 'F9' || e.code === 'F9') { e.preventDefault(); capture(); }\n"
 "});\n"
 "document.getElementById('live').addEventListener('click', capture);\n"
+"const liveImg = document.getElementById('live');\n"
+"const liveStatusEl = document.getElementById('liveStatus');\n"
+"let previewUp = true;\n"
+"async function checkPreviewHealth() {\n"
+"  const up = await fetch('/', {cache:'no-store'}).then(r => r.ok).catch(() => false);\n"
+"  if (!up) {\n"
+"    liveStatusEl.textContent = 'Helper stopped -- preview will reconnect automatically once it is running again.';\n"
+"  } else if (!previewUp) {\n"
+"    liveImg.src = '/preview?t=' + Date.now();\n"
+"    liveStatusEl.textContent = 'Reconnected.';\n"
+"  } else {\n"
+"    liveStatusEl.textContent = '';\n"
+"  }\n"
+"  previewUp = up;\n"
+"}\n"
+"checkPreviewHealth();\n"
+"setInterval(checkPreviewHealth, 2000);\n"
 "document.getElementById('clear').addEventListener('click', () => {\n"
 "  const canvas = document.getElementById('captured');\n"
 "  canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);\n"
@@ -480,6 +498,13 @@ static void handle_client(SOCKET sock) {
 
     char method[16] = {0}, path[256] = {0};
     sscanf(buf, "%15s %255s", method, path);
+
+    // Strip a query string before routing: none of our endpoints take
+    // parameters, and callers commonly append one anyway as a cache-buster
+    // (e.g. "/preview?t=123" to force a browser to re-open the stream).
+    // Without this every such request 404s.
+    char *query = strchr(path, '?');
+    if (query) *query = '\0';
 
     if (strcmp(path, "/") == 0 || strcmp(path, "/index.html") == 0) {
         char hdr[256];

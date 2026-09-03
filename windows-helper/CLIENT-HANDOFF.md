@@ -111,8 +111,10 @@ Also spot-check the bare `helper.exe` from the same release the same way it's us
 
 ```powershell
 .\helper.exe 8080
-# Open http://localhost:8080/ in a browser, press the hardware button,
-# confirm the capture shows up in the canvas.
+# Runs in tray mode: a console window flashes and vanishes, then a tray icon
+# appears and a balloon reports the result. Open http://localhost:8080/ in a
+# browser, press the hardware button, confirm the capture shows up in the
+# canvas, then right-click the tray icon -> Exit when done.
 ```
 
 **Fallback — build it yourself.** Only needed when you are testing a change that has not been released yet (see [`README.md`](README.md) for the full build and release docs):
