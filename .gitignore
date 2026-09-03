@@ -63,6 +63,21 @@ coverage.html
 *.cover
 
 # =============================================================================
+# C++ Windows helper (windows-helper/) - build output only
+# The generic `dist/` and `*.exe` rules above already cover most of this; these
+# entries are spelled out so it is obvious what `make` / `make static` drops on
+# the floor. Sources stay tracked: helper.cpp, helper.rc, Makefile and the
+# app icon under windows-helper/assets/ are all committed - do NOT ignore
+# windows-helper/assets/ or *.ico.
+# =============================================================================
+# `make shared` output (exe + mingw runtime DLLs)
+windows-helper/dist/
+# `make static` output (single self-contained exe)
+windows-helper/dist-static/
+# intermediate objects, including the windres-compiled resource object
+windows-helper/build/
+
+# =============================================================================
 # Python (prototype helpers + investigation venv)
 # =============================================================================
 __pycache__/

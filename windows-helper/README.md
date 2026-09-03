@@ -41,7 +41,7 @@ This is the **working Windows path** produced by the investigation documented in
 
 ## Quick start (end user, on a fresh Windows machine)
 
-1. Copy either `dist/` (folder) **or** `dist-static/helper.exe` (single file) to the target machine.
+1. Get `helper.exe` onto the target machine — download it from the [latest release](https://github.com/ronpik/indmu-dermoscope-button-listener/releases/latest) (see [Releases](#releases)), or copy a locally built `dist-static/helper.exe` (single file) or `dist/` (folder, exe + DLLs).
 2. Plug in the dermoscope.
 3. Double-click `helper.exe`. A console window may flash briefly and vanish (the helper detaches it at startup); an icon then shows up in the system tray (notification area), the helper starts capture immediately, and a balloon tells you the result: running, camera busy, device not found, or a generic start failure pointing at `helper.log`.
 4. Open `http://localhost:8080/` in a browser for the built-in test page, or open the production web app. (Right-click the tray icon → **Open test page** does the same thing.)
@@ -98,21 +98,41 @@ Requires MSYS2 with the mingw-w64 toolchain. Same setup that builds the Go helpe
 
 ```bash
 # in MSYS2 MINGW64 shell
-pacman -S --needed mingw-w64-x86_64-gcc make
+pacman -S --needed mingw-w64-x86_64-gcc mingw-w64-x86_64-binutils make
 cd windows-helper
 make              # builds both shared and static
 # or:
 make shared       # small exe + 3 DLLs in dist/
 make static       # single fat exe in dist-static/
+make static VERSION=1.2.3   # same, but stamps 1.2.3 into the version resource
 make clean
 ```
+
+### Version and resources (`helper.rc`)
+
+`VERSION` sets the exe's Win32 version resource — the file version, product version, company and description that Explorer shows under **Properties → Details**, and that Windows reputation heuristics look at on an unsigned binary. It **defaults to `0.0.0`**, so a plain `make static` produces an exe that reports `0.0.0`; release builds always pass the real number (see [Releases](#releases)).
+
+```bash
+make static VERSION=1.2.3
+```
+
+| Given | Stamped |
+|---|---|
+| *(nothing)* | `0.0.0` |
+| `VERSION=1.2.3` | `1.2.3` |
+| `VERSION=v1.2.3` | `1.2.3` — a leading `v` is stripped, so a tag name can be passed straight through |
+| `VERSION=1.2.3-rc1` | `1.2.3-rc1` in the displayed strings, `1.2.3.0` in the numeric `FILEVERSION` fields |
+
+Changing only `VERSION` is enough to force a re-stamp: the resource object also depends on `build/version.stamp`, which records the requested version and is rewritten only when that value actually changes. No `make clean` needed.
+
+The resource script is [`helper.rc`](helper.rc). Besides the version block it embeds the application icon from [`assets/helper.ico`](assets/helper.ico) under **resource ID 101** (`IDI_APP`). That ID is fixed by contract — anything that needs the icon at runtime loads it with `LoadIcon(hInstance, MAKEINTRESOURCE(101))` — so do not renumber it. `helper.rc` is compiled by `windres` (from `mingw-w64-x86_64-binutils`) into `build/helper_res.o`, which the link step folds into the exe; `make` fails early with an install hint if `g++` or `windres` is missing. `helper.rc` and `assets/helper.ico` are tracked source files; `build/`, `dist/` and `dist-static/` are git-ignored.
 
 ### What `shared` vs `static` produce
 
 | Target | Output | Size | Notes |
 |---|---|---|---|
-| `make shared` | `dist/helper.exe` + `libstdc++-6.dll`, `libgcc_s_seh-1.dll`, `libwinpthread-1.dll` | ~800 KB exe + ~2.7 MB DLLs | Ship the whole folder. DLLs are the mingw-w64 C/C++ runtime. |
-| `make static` | `dist-static/helper.exe` | ~3.4 MB single file | No external deps. Drop anywhere and run. Slower to link, larger binary. |
+| `make shared` | `dist/helper.exe` + `libstdc++-6.dll`, `libgcc_s_seh-1.dll`, `libwinpthread-1.dll` | ~870 KB exe + ~2.7 MB DLLs | Ship the whole folder. DLLs are the mingw-w64 C/C++ runtime. Local builds only — never published to a release. |
+| `make static` | `dist-static/helper.exe` | ~3.4 MB single file | No external deps. Drop anywhere and run. Slower to link, larger binary. **This is the build the Releases page ships.** |
 
 Both link against **only inbox Windows DLLs** at runtime:
 - `KERNEL32.dll`, `USER32.dll` — base Win32
@@ -129,6 +149,55 @@ All of those are present on every Windows 7/8/10/11 installation. No Visual C++ 
 ### The one gotcha: `qedit.dll`
 
 Microsoft deprecated `qedit.dll` long ago but it still ships with Windows 10 and 11. If a future Windows version removes it, `CoCreateInstance(CLSID_SampleGrabber)` will fail and the helper won't start. The replacement would be Media Foundation (`IMFSourceReader` + custom sink) — not done here because qedit still works today.
+
+---
+
+## Releases
+
+End users do not build this. They download the prebuilt exe from the repo's Releases page:
+
+**https://github.com/ronpik/indmu-dermoscope-button-listener/releases/latest**
+
+The asset is named exactly `helper.exe` — a stable name that docs and client instructions hard-code, so it must not change between releases. `helper-<version>-windows-x64.zip`, holding the same exe at its root, is attached alongside it for browsers and AV products that block a bare `.exe` download. See [`CLIENT-HANDOFF.md`](CLIENT-HANDOFF.md) for what to tell a pilot customer.
+
+### Cutting a release
+
+`release.yml` must already be on the default branch (`main`). GitHub reads both the `release` and `workflow_dispatch` triggers from there, so merge the workflow before cutting the first release — on a feature branch neither trigger exists.
+
+Tags are `vX.Y.Z`. Tag, push, and publish a GitHub release from that tag:
+
+```bash
+git tag v1.2.3
+git push origin v1.2.3
+# then publish a release from that tag in the GitHub UI, or in one step:
+gh release create v1.2.3 --generate-notes
+```
+
+**Publishing the release is what fires the workflow.** Pushing the tag on its own does nothing, and a *draft* release does nothing either — the build only starts when the release is actually published. If you created a draft, publish it to trigger the build.
+
+The version handed to `make` is the tag with the leading `v` stripped: tag `v1.2.3` → `make static VERSION=1.2.3`.
+
+### What the workflow does
+
+[`.github/workflows/release.yml`](../.github/workflows/release.yml), on a `windows-latest` runner:
+
+| Step | Detail |
+|---|---|
+| Toolchain | MSYS2 with the MINGW64 mingw-w64 toolchain — the same compiler a local build uses. |
+| Build | `make static VERSION=<tag without the leading v>`, so the published exe carries the release's version in its resource metadata. |
+| Release assets | Attaches `helper.exe` and `helper-<version>-windows-x64.zip` to the published release (release events only). |
+| Workflow artifact | Uploads `helper.exe` as a run artifact, `helper-<version>-windows-x64`, on every run — so a build is retrievable from the Actions run even when there is no release. |
+| Checksum | Prints the version, byte size and SHA256 of `helper.exe` into the run summary. Verify a download with `Get-FileHash .\helper.exe -Algorithm SHA256`. |
+
+### Smoke-testing without cutting a release
+
+The workflow also has a `workflow_dispatch` trigger: **Actions** tab → **Release** → **Run workflow**. It takes an optional `version` input (default `0.0.0-dev`), builds the exe, and uploads it as a workflow artifact without creating a tag or touching any release — download the artifact from the run page and test it. This exercises the whole build and packaging path; the only step it does not reach is attaching the assets to a release, which runs on release events only.
+
+Like a real release, this needs the workflow to be on the default branch — `workflow_dispatch` only lists workflows that exist on `main`.
+
+### Code signing
+
+Not wired up yet — the published exe is unsigned, so SmartScreen may warn on first run ("More info" → "Run anyway"). There is a commented-out Azure Trusted Signing placeholder in [`.github/workflows/release.yml`](../.github/workflows/release.yml) for when we do it.
 
 ---
 
@@ -272,18 +341,25 @@ The captured image (`/still`) is a snapshot of the Preview pin at the moment the
 ```
 windows-helper/
 ├── README.md          -- this file
-├── Makefile           -- shared + static build targets
+├── CLIENT-HANDOFF.md  -- what to send a pilot customer, and how they run it
+├── Makefile           -- shared + static build targets, VERSION stamping
 ├── helper.cpp         -- single-file implementation
-├── dist/              -- shared-build output (created by `make shared`)
+├── helper.rc          -- Win32 resources: version info + app icon (ID 101)
+├── assets/
+│   └── helper.ico     -- app icon, resource ID 101 (tracked source, not build output)
+├── build/             -- intermediate objects incl. windres output    [git-ignored]
+├── dist/              -- shared-build output (`make shared`)          [git-ignored]
 │   ├── helper.exe
 │   ├── libstdc++-6.dll
 │   ├── libgcc_s_seh-1.dll
 │   └── libwinpthread-1.dll
-└── dist-static/       -- static-build output (created by `make static`)
+└── dist-static/       -- static-build output (`make static`)          [git-ignored]
     └── helper.exe
 ```
 
 At runtime, tray mode writes `helper.log` (and, after a rotation, `helper.log.1`) next to `helper.exe` itself — the exe's own folder, not the current working directory.
+
+The `[git-ignored]` directories are listed explicitly in the repo root [`.gitignore`](../.gitignore); no built binary is ever committed. Released exes live on the [Releases page](https://github.com/ronpik/indmu-dermoscope-button-listener/releases), not in the tree.
 
 ---
 

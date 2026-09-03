@@ -6,19 +6,32 @@ What to send to the clinician's workstation (or QA / pilot user) to run the help
 
 ## What to send
 
-**One file:** [`dist-static/helper.exe`](dist-static/helper.exe) (~3.4 MB, no dependencies).
+**One file:** `helper.exe` (~3.4 MB, no dependencies), downloaded from the repo's Releases page:
 
-Built with `make static` from the source in this folder. Single self-contained Windows executable — no DLLs, no installer, no admin rights, no Visual C++ Redistributable required. Links against only inbox Windows DLLs (`kernel32`, `user32`, `ole32`, `oleaut32`, `ws2_32`, `quartz`, `qedit`), all present on every Windows 10/11 install.
+**https://github.com/ronpik/indmu-dermoscope-button-listener/releases/latest**
 
-If you need a smaller exe, `dist/helper.exe` (~800 KB) ships with three mingw runtime DLLs alongside (`libstdc++-6.dll`, `libgcc_s_seh-1.dll`, `libwinpthread-1.dll`) — send the whole `dist/` folder in that case. For a first customer drop, the single-file static build is the simpler experience.
+The asset is named exactly `helper.exe` — that name is stable across releases, so docs and client-side instructions can hard-code it. `helper-<version>-windows-x64.zip` is attached alongside it for people whose browser or antivirus blocks a bare `.exe` download; unzip it and you have the identical binary. Send the client a link to the release rather than emailing the exe, if you can — mail gateways strip executables.
+
+The release asset is the **static** build (`make static`). Single self-contained Windows executable — no DLLs, no installer, no admin rights, no Visual C++ Redistributable required. Links against only inbox Windows DLLs (`kernel32`, `user32`, `ole32`, `oleaut32`, `ws2_32`, `quartz`, `qedit`), all present on every Windows 10/11 install.
+
+**Checksum.** The release workflow prints the SHA256 of the published `helper.exe` into its run summary (Actions → the `Release` run for that tag). To confirm the client got the right file:
+
+```powershell
+Get-FileHash .\helper.exe -Algorithm SHA256
+```
+
+**Not code-signed yet.** There is no Authenticode signature on the exe, so Windows SmartScreen may show "Windows protected your PC" the first time it runs — the user clicks **More info** → **Run anyway**. The exe does carry version metadata (company `Indmu`, description `Dermoscope Helper`, file/product version — visible under Properties → Details), which makes it look less anonymous and helps some reputation heuristics, but it is not a substitute for signing. Warn the client about this before they open the file.
+
+**Smaller, local-only alternative.** The shared build (`make shared` → `dist/helper.exe`, ~870 KB) needs three mingw runtime DLLs beside it (`libstdc++-6.dll`, `libgcc_s_seh-1.dll`, `libwinpthread-1.dll`), so you would have to send the whole `dist/` folder. It is never attached to a release. For a customer drop the single-file static build from the Releases page is the simpler experience.
 
 ---
 
 ## What the client does
 
 1. Plug the dermoscope into a USB port.
-2. Double-click `helper.exe`. A console window flashes briefly and vanishes — that is expected; the helper detaches it and keeps running in the background. An icon then appears in the system tray (notification area), capture starts on its own, and a balloon reports the result.
+2. Double-click `helper.exe`. On the very first run SmartScreen may interrupt: **More info** → **Run anyway** (see "What to send" — the exe is not signed yet). A console window then flashes briefly and vanishes — that is expected; the helper detaches it and keeps running in the background. An icon appears in the system tray (notification area), capture starts on its own, and a balloon reports the result.
    - **Windows 11 hides new tray icons by default.** The first time, look in the overflow flyout behind the `^` chevron on the taskbar. Drag the icon onto the taskbar to pin it.
+   - To get the old foreground-in-a-terminal behaviour instead — the terminal keeps the log visible, which helps diagnose issues — run `helper.exe --console`.
 3. Open `http://localhost:8080/` in a browser — the built-in test page shows live preview. (Right-click the tray icon → **Open test page** does the same thing.) Press the hardware button on the dermoscope → full-res capture appears in the canvas on the right. That's the smoke test.
 4. If it works, point the production web app at `http://localhost:8080/preview` and `http://localhost:8080/still`.
 5. When finished, right-click the tray icon → **Exit**. That is how you quit the helper and release the camera for other apps — there is no window to close.
@@ -78,6 +91,16 @@ Both endpoints send `Access-Control-Allow-Origin: *`, so cross-origin from any w
 ---
 
 ## How to verify before sending
+
+**Normal path — check the released exe.** Download `helper.exe` from the [latest release](https://github.com/ronpik/indmu-dermoscope-button-listener/releases/latest), compare `Get-FileHash .\helper.exe -Algorithm SHA256` against the SHA256 in that release's workflow run summary, then run it on a Windows box with the dermoscope plugged in:
+
+```powershell
+.\helper.exe 8080
+# Open http://localhost:8080/ in a browser, press the hardware button,
+# confirm the capture shows up in the canvas.
+```
+
+**Fallback — build it yourself.** Only needed when you are testing a change that has not been released yet (see [`README.md`](README.md) for the full build and release docs):
 
 ```bash
 # In MSYS2 MINGW64:
