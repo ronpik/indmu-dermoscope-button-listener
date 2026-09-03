@@ -353,6 +353,14 @@ Browser support is universal. You can also read the same URL with `fetch()` and 
 
 Response headers include `Access-Control-Allow-Origin: *` so the endpoint can be consumed from any origin.
 
+Each 1600x1200 stream is bandwidth-heavy. If more than one `/preview` viewer is
+open, the helper gives every viewer every Nth camera frame (where N is the
+current viewer count). This keeps aggregate preview traffic close to one
+full-rate stream instead of multiplying it per tab. Closing the extra viewer
+automatically restores the remaining viewer to the full camera rate. This
+affects preview cadence only; `/still` continues to use the latest
+full-resolution camera frame.
+
 Query strings on any endpoint are accepted and ignored (stripped before routing), so the common cache-busting pattern `/preview?t=${Date.now()}` works as expected — see "Recovering from a Stop/Start cycle" below for why you'd want that.
 
 ### `GET /still`
@@ -385,6 +393,7 @@ Returns `200 application/json` whenever the helper's HTTP server is up — the r
   "version": "1.2.3",
   "device": "USB Camera",
   "preview_frames": 4821,
+  "preview_clients": 1,
   "still_seq": 3,
   "still_available": true,
   "port": 8080,
@@ -397,7 +406,8 @@ Returns `200 application/json` whenever the helper's HTTP server is up — the r
 | `status` | Always `"running"` — the HTTP server (and so `/health`) exists only while capture is running; when the helper is stopped or not running, the connection is refused instead of returning a different `status` value. |
 | `version` | The stamped version (see [Version and resources](#version-and-resources-helperrc)); `0.0.0` for an unstamped local build. |
 | `device` | DirectShow friendly name of the camera the helper attached to. |
-| `preview_frames` | Running count of preview frames delivered since this capture session started. |
+| `preview_frames` | Running count of preview frames captured and published inside the helper since this capture session started, including frames produced with no viewer or skipped for an individual viewer by multi-viewer throttling. |
+| `preview_clients` | Number of active `/preview` viewers. With more than one viewer, the helper automatically divides preview frames between them so aggregate network traffic stays close to one full-rate stream; the high-resolution `/still` capture buffer is unaffected. |
 | `still_seq` | Running count of accepted (non-debounced) button presses since this session started. |
 | `still_available` | Whether `/still` currently has an image to serve — `false` until the first button press of this session. |
 | `port` | The TCP port the helper is actually listening on. |
