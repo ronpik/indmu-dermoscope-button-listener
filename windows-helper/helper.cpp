@@ -7,11 +7,20 @@
 // Endpoints (default port 8080):
 //   GET /          -> minimal HTML test page (preview + capture + F9 handler)
 //   GET /preview   -> multipart/x-mixed-replace MJPEG stream (1600x1200 live)
-//   GET /still     -> image/jpeg of the most recent button-triggered still
+//   GET /still     -> image/jpeg of the most recent button-triggered still,
+//                     or 204 No Content if no still has been captured yet
+//                     this session
+//   GET /health    -> application/json helper status, for a web app to
+//                     detect that the helper is running (see it below)
+//   OPTIONS <path> -> 204 with CORS headers, for any of the paths above
 //
 // Web-app integration contract:
+//   - poll GET /health to detect the helper; a refused connection means it
+//     is stopped or not running -- that is the "not connected" signal, not
+//     a 404/204 from /still
 //   - <img src="http://localhost:8080/preview"> for live video
-//   - listen for F9 keydown; on receipt, fetch('/still') for the full-res JPEG
+//   - listen for F9 keydown; on receipt, fetch('/still') for the full-res
+//     JPEG (treat 204 as "no still yet", not an error)
 //
 // Run modes:
 //   helper.exe [port] [debounce_ms]
@@ -59,6 +68,7 @@
 #include <string.h>
 #include <wchar.h>
 #include <wctype.h>
+#include <string>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -68,6 +78,13 @@
 #include <chrono>
 
 #pragma comment(lib, "ws2_32.lib")
+
+// Stamped by the Makefile via -DHELPER_VERSION=\"x.y.z\" (see CXXFLAGS in
+// Makefile), mirroring the VERSIONINFO resource. Falls back to 0.0.0 for a
+// bare `g++ helper.cpp` outside the normal build.
+#ifndef HELPER_VERSION
+#define HELPER_VERSION "0.0.0"
+#endif
 
 // Software debounce for the hardware button. The device's own firmware has
 // a multi-second cooldown between stills at these settings, so this is
@@ -139,6 +156,16 @@ static std::atomic<long long> g_previewSeq{0};
 static std::mutex g_stillMutex;
 static std::vector<BYTE> g_latestStill;
 static std::atomic<long long> g_stillSeq{0};
+
+// DirectShow friendly name of the attached camera, for GET /health. Written
+// once (UI thread, inside find_dermoscope()) per start_capture() call; read
+// from HTTP threads, hence the mutex.
+static std::mutex g_deviceNameMu;
+static std::string g_deviceName;
+
+// steady_clock ms timestamp of the current capture session's start, for
+// GET /health's uptime_s. 0 means no session has started yet.
+static std::atomic<long long> g_sessionStartMs{0};
 
 // "The HTTP server is up." Deliberately distinct from "the app is exiting" so
 // that Stop -> Start cycles work: stop_capture() clears it, start_capture()
@@ -295,6 +322,39 @@ public:
     }
 };
 
+// ---- Small string helpers ----
+static std::string wide_to_utf8(const wchar_t *w) {
+    if (!w) return std::string();
+    int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    if (len <= 0) return std::string();
+    std::string out((size_t)len - 1, '\0');   // len counts the null terminator
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, &out[0], len, NULL, NULL);
+    return out;
+}
+
+static std::string json_escape(const std::string &s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += (char)c;
+                }
+        }
+    }
+    return out;
+}
+
 // ---- DirectShow setup ----
 static IBaseFilter* find_dermoscope(const char *substr) {
     ICreateDevEnum *pSysDevEnum = NULL;
@@ -322,8 +382,13 @@ static IBaseFilter* find_dermoscope(const char *substr) {
                 for (size_t i=0; substr[i] && i<63; ++i) target[i] = (wchar_t)substr[i];
                 if (wcsstr(lo, target)) {
                     pMon->BindToObject(0,0,IID_IBaseFilter,(void**)&pSrc);
-                    log_ts("Selected device: %S",
-                           (vName.vt == VT_BSTR && vName.bstrVal) ? vName.bstrVal : L"(unnamed)");
+                    const wchar_t *nameW =
+                        (vName.vt == VT_BSTR && vName.bstrVal) ? vName.bstrVal : L"(unnamed)";
+                    log_ts("Selected device: %S", nameW);
+                    {
+                        std::lock_guard<std::mutex> lk(g_deviceNameMu);
+                        g_deviceName = wide_to_utf8(nameW);
+                    }
                 }
             }
             VariantClear(&vName); VariantClear(&vDev);
@@ -423,6 +488,7 @@ static const char INDEX_HTML[] =
 "async function capture() {\n"
 "  try {\n"
 "    const resp = await fetch('/still', {cache:'no-store'});\n"
+"    if (resp.status === 204) { setStatus('No capture yet -- press the hardware button.'); return; }\n"
 "    if (!resp.ok) { setStatus(`/still returned ${resp.status}`); return; }\n"
 "    const blob = await resp.blob();\n"
 "    const url  = URL.createObjectURL(blob);\n"
@@ -460,6 +526,14 @@ static const char INDEX_HTML[] =
 "}\n"
 "checkPreviewHealth();\n"
 "setInterval(checkPreviewHealth, 2000);\n"
+"async function showHealth() {\n"
+"  try {\n"
+"    const resp = await fetch('/health', {cache:'no-store'});\n"
+"    const data = await resp.json();\n"
+"    setStatus(`/health: ${JSON.stringify(data)}`);\n"
+"  } catch(e) { setStatus(`/health error: ${e.message}`); }\n"
+"}\n"
+"showHealth();\n"
 "document.getElementById('clear').addEventListener('click', () => {\n"
 "  const canvas = document.getElementById('captured');\n"
 "  canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);\n"
@@ -505,6 +579,23 @@ static void handle_client(SOCKET sock) {
     // Without this every such request 404s.
     char *query = strchr(path, '?');
     if (query) *query = '\0';
+
+    bool knownPath = strcmp(path, "/") == 0 || strcmp(path, "/index.html") == 0 ||
+                     strcmp(path, "/preview") == 0 || strcmp(path, "/still") == 0 ||
+                     strcmp(path, "/health") == 0;
+
+    // CORS preflight. Handled before routing by path so a preflight never
+    // falls into e.g. /preview's streaming loop or /still's image body.
+    if (strcmp(method, "OPTIONS") == 0 && knownPath) {
+        const char *r = "HTTP/1.0 204 No Content\r\n"
+                        "Access-Control-Allow-Origin: *\r\n"
+                        "Access-Control-Allow-Methods: GET, OPTIONS\r\n"
+                        "Access-Control-Allow-Headers: *\r\n"
+                        "Access-Control-Max-Age: 600\r\n"
+                        "Connection: close\r\n\r\n";
+        send_all(sock, r, (int)strlen(r));
+        return;
+    }
 
     if (strcmp(path, "/") == 0 || strcmp(path, "/index.html") == 0) {
         char hdr[256];
@@ -567,12 +658,14 @@ static void handle_client(SOCKET sock) {
             frame = g_latestStill;
         }
         if (frame.empty()) {
-            const char *r = "HTTP/1.0 404 Not Found\r\n"
-                            "Content-Type: text/plain\r\n"
+            // 204, not 404: a web app polling /still needs "nothing captured
+            // yet this session" to be distinguishable from "the helper isn't
+            // running" (which now shows up as a refused connection, or via
+            // GET /health). See the endpoint list at the top of this file.
+            const char *r = "HTTP/1.0 204 No Content\r\n"
+                            "Cache-Control: no-store\r\n"
                             "Access-Control-Allow-Origin: *\r\n"
-                            "Content-Length: 22\r\n"
-                            "Connection: close\r\n\r\n"
-                            "no still captured yet\n";
+                            "Connection: close\r\n\r\n";
             send_all(sock, r, (int)strlen(r));
         } else {
             char hdr[256];
@@ -587,6 +680,47 @@ static void handle_client(SOCKET sock) {
             send_all(sock, hdr, hlen);
             send_all(sock, (const char*)frame.data(), (int)frame.size());
         }
+        return;
+    }
+
+    if (strcmp(path, "/health") == 0) {
+        std::string device;
+        {
+            std::lock_guard<std::mutex> lk(g_deviceNameMu);
+            device = g_deviceName;
+        }
+        bool stillAvailable;
+        {
+            std::lock_guard<std::mutex> lk(g_stillMutex);
+            stillAvailable = !g_latestStill.empty();
+        }
+        long long startMs = g_sessionStartMs.load();
+        long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        long long uptimeS = (startMs > 0 && nowMs > startMs) ? (nowMs - startMs) / 1000 : 0;
+
+        // status is always "running": the HTTP server -- and so /health --
+        // only exists while capture is running (see the top of this file).
+        std::string body;
+        body += "{\"status\":\"running\",\"version\":\"" + json_escape(HELPER_VERSION) + "\"";
+        body += ",\"device\":\"" + json_escape(device) + "\"";
+        body += ",\"preview_frames\":" + std::to_string(g_previewSeq.load());
+        body += ",\"still_seq\":" + std::to_string(g_stillSeq.load());
+        body += std::string(",\"still_available\":") + (stillAvailable ? "true" : "false");
+        body += ",\"port\":" + std::to_string(g_port);
+        body += ",\"uptime_s\":" + std::to_string(uptimeS) + "}";
+
+        char hdr[256];
+        int hlen = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.0 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Cache-Control: no-store\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Content-Length: %zu\r\n"
+            "Connection: close\r\n\r\n",
+            body.size());
+        send_all(sock, hdr, hlen);
+        send_all(sock, body.data(), (int)body.size());
         return;
     }
 
@@ -711,6 +845,8 @@ static bool http_server_start(int port) {
     }
     g_listenSock = srv;
     g_serverRunning = true;
+    g_sessionStartMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
     g_acceptThread = new std::thread(accept_loop, srv);
     return true;
 }
@@ -869,8 +1005,13 @@ static void stop_capture() {
         g_latestStill.clear();
         g_latestStill.shrink_to_fit();
     }
+    {
+        std::lock_guard<std::mutex> lk(g_deviceNameMu);
+        g_deviceName.clear();
+    }
     g_previewSeq.store(0);
     g_stillSeq.store(0);
+    g_sessionStartMs.store(0);
 
     g_state.store(HelperState::Stopped);
     if (hadSomething && stoppedClean) log_ts("Capture stopped; camera released.");

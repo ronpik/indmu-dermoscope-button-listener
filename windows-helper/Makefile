@@ -59,6 +59,12 @@ VER_MINOR := $(or $(word 2,$(V_PARTS)),0)
 VER_PATCH := $(or $(word 3,$(V_PARTS)),0)
 VER_BUILD := $(or $(word 4,$(V_PARTS)),0)
 
+# Same VER_CLEAN string, visible to helper.cpp (GET /health reports it) via
+# -D. Unlike RCFLAGS above, this recipe line runs the compiler directly
+# rather than through windres's own re-shelling, so one level of
+# backslash-escaping is enough to hand g++ a real string-literal token.
+CXXFLAGS  += -DHELPER_VERSION=\"$(VER_CLEAN)\"
+
 WINDRES   ?= windres
 RC        := helper.rc
 ICON      := assets/helper.ico
