@@ -132,7 +132,7 @@ The resource script is [`helper.rc`](helper.rc). Besides the version block it em
 | Target | Output | Size | Notes |
 |---|---|---|---|
 | `make shared` | `dist/helper.exe` + `libstdc++-6.dll`, `libgcc_s_seh-1.dll`, `libwinpthread-1.dll` | ~870 KB exe + ~2.7 MB DLLs | Ship the whole folder. DLLs are the mingw-w64 C/C++ runtime. Local builds only — never published to a release. |
-| `make static` | `dist-static/helper.exe` | ~3.4 MB single file | No external deps. Drop anywhere and run. Slower to link, larger binary. **This is the build the Releases page ships.** |
+| `make static` | `dist-static/helper.exe` | ~3.4 MB single file, built locally | No external deps. Drop anywhere and run. Slower to link, larger binary. **This is the build the Releases page ships**, though the CI-built asset is smaller (~1.5 MB) — the runner's mingw-w64 links a smaller static C++ runtime. |
 
 Both link against **only inbox Windows DLLs** at runtime:
 - `KERNEL32.dll`, `USER32.dll` — base Win32

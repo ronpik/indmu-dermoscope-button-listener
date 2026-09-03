@@ -6,13 +6,15 @@ What to send to the clinician's workstation (or QA / pilot user) to run the help
 
 ## What to send
 
-**One file:** `helper.exe` (~3.4 MB, no dependencies), downloaded from the repo's Releases page:
+**One file:** `helper.exe` (roughly 1.5 MB, no dependencies), downloaded from the repo's Releases page:
 
 **https://github.com/ronpik/indmu-dermoscope-button-listener/releases/latest**
 
 The asset is named exactly `helper.exe` — that name is stable across releases, so docs and client-side instructions can hard-code it. `helper-<version>-windows-x64.zip` is attached alongside it for people whose browser or antivirus blocks a bare `.exe` download; unzip it and you have the identical binary. Send the client a link to the release rather than emailing the exe, if you can — mail gateways strip executables.
 
-The release asset is the **static** build (`make static`). Single self-contained Windows executable — no DLLs, no installer, no admin rights, no Visual C++ Redistributable required. Links against only inbox Windows DLLs (`kernel32`, `user32`, `ole32`, `oleaut32`, `ws2_32`, `quartz`, `qedit`), all present on every Windows 10/11 install.
+The release asset is the **static** build (`make static`). Single self-contained Windows executable — no DLLs, no installer, no admin rights, no Visual C++ Redistributable required. Links against only inbox Windows DLLs (`kernel32`, `user32`, `ole32`, `oleaut32`, `ws2_32`, `shell32`, `gdi32`, `quartz`, `qedit`), all present on every Windows 10/11 install.
+
+**Do not use the file size as an integrity check** — use the checksum below. A locally built `helper.exe` is around 3.4 MB while the released one is around 1.5 MB, because the GitHub runner's mingw-w64 toolchain links a considerably smaller static C++ runtime than a typical local MSYS2 install. Both are equally self-contained; the difference is the build environment, not the contents.
 
 **Checksum.** The release workflow prints the SHA256 of the published `helper.exe` into its run summary (Actions → the `Release` run for that tag). To confirm the client got the right file:
 
