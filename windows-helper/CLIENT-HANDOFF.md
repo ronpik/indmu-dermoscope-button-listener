@@ -29,11 +29,17 @@ Get-FileHash .\helper.exe -Algorithm SHA256
 ## What the client does
 
 1. Plug the dermoscope into a USB port.
-2. Double-click `helper.exe` (or run from a terminal — terminal keeps the log visible, which helps diagnose issues). It stays in the foreground. On the very first run SmartScreen may interrupt: **More info** → **Run anyway** (see "What to send" — the exe is not signed yet).
-3. Open `http://localhost:8080/` in a browser — the built-in test page shows live preview. Press the hardware button on the dermoscope → full-res capture appears in the canvas on the right. That's the smoke test.
+2. Double-click `helper.exe`. A console window flashes briefly and vanishes — that is expected; the helper detaches it and keeps running in the background. An icon then appears in the system tray (notification area), capture starts on its own, and a balloon reports the result. On the very first run SmartScreen may interrupt: **More info** → **Run anyway** (see "What to send" — the exe is not signed yet).
+   - **Windows 11 hides new tray icons by default.** The first time, look in the overflow flyout behind the `^` chevron on the taskbar. Drag the icon onto the taskbar to pin it.
+3. Open `http://localhost:8080/` in a browser — the built-in test page shows live preview. (Right-click the tray icon → **Open test page** does the same thing.) Press the hardware button on the dermoscope → full-res capture appears in the canvas on the right. That's the smoke test.
 4. If it works, point the production web app at `http://localhost:8080/preview` and `http://localhost:8080/still`.
+5. When finished, right-click the tray icon → **Exit**. That is how you quit the helper and release the camera for other apps — there is no window to close.
 
-No admin rights, no driver install, no firewall prompt (loopback-only bind to `127.0.0.1`).
+Right-clicking the tray icon gives four commands: **Start**, **Stop**, **Open test page**, **Exit**. Left double-click toggles Start / Stop. Hover the icon for a tooltip showing the current state (`running`, `stopped`, `device not found`, `camera busy`, `error`).
+
+The log goes to `helper.log`, in the same folder as `helper.exe`. That is the first place to look if anything misbehaves. To get the old foreground-in-a-terminal behaviour with the log on stderr instead, run `helper.exe --console`.
+
+No admin rights, no driver install, no firewall prompt (loopback-only bind to `127.0.0.1`). Only one copy runs at a time — launching a second `helper.exe` exits immediately and the running one shows a balloon saying so.
 
 ---
 
@@ -89,8 +95,10 @@ Both endpoints send `Access-Control-Allow-Origin: *`, so cross-origin from any w
 
 ```powershell
 .\helper.exe 8080
-# Open http://localhost:8080/ in a browser, press the hardware button,
-# confirm the capture shows up in the canvas.
+# Runs in tray mode: a console window flashes and vanishes, then a tray icon
+# appears and a balloon reports the result. Open http://localhost:8080/ in a
+# browser, press the hardware button, confirm the capture shows up in the
+# canvas, then right-click the tray icon -> Exit when done.
 ```
 
 **Fallback — build it yourself.** Only needed when you are testing a change that has not been released yet (see [`README.md`](README.md) for the full build and release docs):
@@ -98,25 +106,30 @@ Both endpoints send `Access-Control-Allow-Origin: *`, so cross-origin from any w
 ```bash
 # In MSYS2 MINGW64:
 cd windows-helper
-make static      # builds dist-static/helper.exe
-./dist-static/helper.exe 8080
-# Same smoke test as above.
+make static                        # builds dist-static/helper.exe
+./dist-static/helper.exe --console 8080
+# --console keeps the log on stderr where you can watch it. Open
+# http://localhost:8080/ in a browser, press the hardware button, confirm the
+# capture shows up in the canvas. Ctrl-C exits cleanly and releases the camera.
 ```
 
-Expected log on a good run — identical either way:
+Verify the shipping (tray) behaviour too: double-click `dist-static/helper.exe`, confirm the tray icon appears and the balloon says it is running, then right-click → **Exit** and confirm the camera is free afterwards (the Windows Camera app should open the dermoscope).
+
+Expected log on a good run — on stderr with `--console`, otherwise in `helper.log` next to the exe:
 
 ```
-[HH:MM:SS.mmm] Config: port=8080 debounce_ms=300
+[HH:MM:SS.mmm] Config: port=8080 debounce_ms=300 mode=console
 [HH:MM:SS.mmm] Looking for dermoscope (vid_ab02)...
 [HH:MM:SS.mmm] Selected device: USB Camera
 [HH:MM:SS.mmm] Setting format MJPG 1600x1200 on pin
 [HH:MM:SS.mmm] Setting format MJPG 320x240 on pin
 [HH:MM:SS.mmm] MediaControl::Run HR=0x00000001
 [HH:MM:SS.mmm] Graph state: 2 (2=Running)
+[HH:MM:SS.mmm] HTTP server listening on http://localhost:8080/
 [HH:MM:SS.mmm] Helper ready. Open http://localhost:8080/ in your browser.
-[HH:MM:SS.mmm] Hardware button -> F9 -> web app fetches /still. Ctrl-C to quit.
+[HH:MM:SS.mmm] Hardware button -> F9 -> web app fetches /still.
 # ... on button press:
 [HH:MM:SS.mmm]   still trigger -> /still 413392 bytes, sending F9
 ```
 
-If `MediaControl::Run` returns anything other than `0x00000000` or `0x00000001`, or if `Graph state` is not `2`, something else is holding the camera — close Teams / Zoom / browser cam tabs / other helper instances and retry.
+If `MediaControl::Run` returns anything other than `0x00000000` or `0x00000001`, or if `Graph state` is not `2`, something else is holding the camera — close Teams / Zoom / browser cam tabs / other helper instances and retry. In tray mode the same condition shows up as a `camera busy` tooltip and balloon.

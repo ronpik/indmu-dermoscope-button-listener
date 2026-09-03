@@ -13,11 +13,28 @@
 //   - <img src="http://localhost:8080/preview"> for live video
 //   - listen for F9 keydown; on receipt, fetch('/still') for the full-res JPEG
 //
+// Run modes:
+//   helper.exe [port] [debounce_ms]
+//     Tray mode. Calls FreeConsole(), logs to helper.log next to the exe, adds
+//     a notification-area icon and auto-starts capture. The icon's right-click
+//     menu offers Start / Stop / Open test page / Exit; left double-click
+//     toggles Start/Stop. Only one instance may run at a time (named mutex).
+//   helper.exe --console [port] [debounce_ms]
+//     Console mode. Keeps the console and logs to stderr exactly as the
+//     original program did; the tray icon still appears. Ctrl-C exits cleanly
+//     (releasing the camera) rather than hard-killing the process.
+//
+// Start/Stop own the whole pipeline: Stop tears the DirectShow graph down and
+// releases every COM interface, so the camera really is handed back to Windows
+// (the Camera app or a browser can open it while we are stopped), and it stops
+// the HTTP server -- closing the listening socket and every live client socket,
+// then joining the threads -- so a later Start can rebind the same port.
+//
 // DirectShow graph:
 //   SourceFilter (HT-B30S)
-//     ├── Capture pin (MJPG 1600x1200) -> SampleGrabber (PreviewCB) -> NullRenderer
-//     │     -- feeds /preview (live) AND serves as the source of /still
-//     └── Still pin   (MJPG 320x240)   -> SampleGrabber (StillCB)   -> NullRenderer
+//     +-- Capture pin (MJPG 1600x1200) -> SampleGrabber (PreviewCB) -> NullRenderer
+//     |     -- feeds /preview (live) AND serves as the source of /still
+//     +-- Still pin   (MJPG 320x240)   -> SampleGrabber (StillCB)   -> NullRenderer
 //           -- used ONLY as the hardware-button trigger; bytes are discarded.
 //              On trigger, we snapshot the latest Capture-pin preview frame
 //              into the /still buffer so /still is always a 1600x1200 JPEG.
@@ -34,8 +51,11 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <shellapi.h>
 #include <dshow.h>
 #include <stdio.h>
+#include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
 #include <wctype.h>
@@ -43,6 +63,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <vector>
+#include <set>
 #include <atomic>
 #include <chrono>
 
@@ -52,6 +73,32 @@
 // a multi-second cooldown between stills at these settings, so this is
 // defense-in-depth only against spurious rapid triggers. Override via argv[2].
 static DWORD g_debounce_ms = 300;
+
+// Configured TCP port (positional arg 1). Also used by the tray "Open test
+// page" command, which must open the real port and not a hard-coded 8080.
+static int g_port = 8080;
+
+// ---- Tray / window constants ----
+#define TRAY_WND_CLASS   L"DermoscopeHelperTrayWnd"
+#define WM_TRAYICON      (WM_APP + 1)
+// Posted by the accept thread when the listening socket dies for good, so the
+// UI thread (the only thread allowed to touch the tray) can tell the truth.
+#define WM_SERVERDOWN    (WM_APP + 2)
+// DirectShow event notifications (IMediaEventEx::SetNotifyWindow) -- how we
+// learn the dermoscope was unplugged while we were running.
+#define WM_GRAPHEVENT    (WM_APP + 3)
+#define TRAY_UID         1
+#define IDM_START        1001
+#define IDM_STOP         1002
+#define IDM_OPENPAGE     1003
+#define IDM_EXIT         1004
+#define IDT_RETRY        1
+#define RETRY_INTERVAL_MS 4000
+// Icon health check. TaskbarCreated is broadcast to top-level windows only, so
+// a message-only window never sees an Explorer restart; polling NIM_MODIFY is
+// how we notice the icon is gone. Also retries an NIM_ADD that failed.
+#define IDT_ICONCHECK    2
+#define ICON_CHECK_INTERVAL_MS 5000
 
 // ---- DirectShow CLSIDs / IIDs not always in mingw headers ----
 static const CLSID CLSID_SampleGrabber_local =
@@ -88,19 +135,74 @@ static std::mutex g_stillMutex;
 static std::vector<BYTE> g_latestStill;
 static std::atomic<long long> g_stillSeq{0};
 
-static std::atomic<bool> g_running{true};
+// "The HTTP server is up." Deliberately distinct from "the app is exiting" so
+// that Stop -> Start cycles work: stop_capture() clears it, start_capture()
+// sets it again.
+static std::atomic<bool> g_serverRunning{false};
+
+enum class HelperState { Stopped, Running, DeviceNotFound, CameraBusy, Error };
+static std::atomic<HelperState> g_state{HelperState::Stopped};
+
+// The message-only tray window. Declared up here because the accept thread and
+// start_capture() both need to post to it; it is only ever *used* on the UI
+// thread beyond PostMessage, which is thread-safe.
+static HWND g_hwnd = NULL;
+
+// ---- Logging ----
+// Console mode: stderr, byte-for-byte the old format. Tray mode: helper.log
+// next to the exe (stderr's handle is dead after FreeConsole, so log_ts must
+// not touch it). Called from DirectShow streaming threads and HTTP threads,
+// hence the mutex; flushed per line so a killed process still leaves a log.
+static FILE *g_logFp = NULL;
+static std::mutex g_logMu;
 
 static void log_ts(const char *fmt, ...) {
     SYSTEMTIME st; GetLocalTime(&st);
     char ts[16];
     snprintf(ts, sizeof(ts), "%02d:%02d:%02d.%03d",
              st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-    fprintf(stderr, "[%s] ", ts);
+    std::lock_guard<std::mutex> lk(g_logMu);
+    FILE *fp = g_logFp;
+    if (!fp) return;
+    fprintf(fp, "[%s] ", ts);
     va_list ap; va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    vfprintf(fp, fmt, ap);
     va_end(ap);
-    fprintf(stderr, "\n");
-    fflush(stderr);
+    fprintf(fp, "\n");
+    fflush(fp);
+}
+
+// Opens helper.log next to the exe, rotating it to helper.log.1 once it passes
+// ~1 MB. Silent no-op on any failure -- losing the log must never be fatal.
+static void open_log_file() {
+    wchar_t dir[MAX_PATH] = {0};
+    DWORD n = GetModuleFileNameW(NULL, dir, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return;
+    wchar_t *slash = wcsrchr(dir, L'\\');
+    if (!slash) return;
+    slash[1] = 0;
+    size_t dirLen = wcslen(dir);
+    if (dirLen + 20 >= MAX_PATH) return;
+
+    wchar_t logPath[MAX_PATH];
+    wcscpy(logPath, dir);
+    wcscat(logPath, L"helper.log");
+    wchar_t oldPath[MAX_PATH];
+    wcscpy(oldPath, logPath);
+    wcscat(oldPath, L".1");
+
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (GetFileAttributesExW(logPath, GetFileExInfoStandard, &fad)) {
+        ULONGLONG sz = ((ULONGLONG)fad.nFileSizeHigh << 32) | (ULONGLONG)fad.nFileSizeLow;
+        if (sz > 1024ULL * 1024ULL) {
+            DeleteFileW(oldPath);
+            MoveFileW(logPath, oldPath);
+        }
+    }
+    FILE *fp = _wfopen(logPath, L"a");
+    if (!fp) return;
+    std::lock_guard<std::mutex> lk(g_logMu);
+    g_logFp = fp;
 }
 
 // ---- Sample Grabber callbacks ----
@@ -109,6 +211,7 @@ public:
     LONG ref = 1;
     LONG frame_count = 0;
     static const LONG FRAME_SKIP = 2;
+    virtual ~PreviewCB() {}   // we delete these by concrete type in stop_capture()
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override {
         if (!ppv) return E_POINTER;
         if (riid == IID_IUnknown || riid == IID_ISampleGrabberCB_local) {
@@ -137,6 +240,7 @@ public:
     LONG ref = 1;
     std::mutex tick_mu;
     DWORD last_press_tick = 0;
+    virtual ~StillCB() {}     // we delete these by concrete type in stop_capture()
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override {
         if (!ppv) return E_POINTER;
@@ -203,7 +307,9 @@ static IBaseFilter* find_dermoscope(const char *substr) {
             VARIANT vName, vDev; VariantInit(&vName); VariantInit(&vDev);
             pBag->Read(L"FriendlyName", &vName, 0);
             pBag->Read(L"DevicePath",   &vDev,  0);
-            if (!pSrc && vDev.bstrVal) {
+            // VariantInit only sets vt = VT_EMPTY; the union is NOT cleared, so
+            // bstrVal is stack garbage unless Read() actually returned a BSTR.
+            if (!pSrc && vDev.vt == VT_BSTR && vDev.bstrVal) {
                 wchar_t lo[1024]={0};
                 wcsncpy(lo, vDev.bstrVal, 1023);
                 for (wchar_t *p=lo; *p; ++p) *p = towlower(*p);
@@ -211,7 +317,8 @@ static IBaseFilter* find_dermoscope(const char *substr) {
                 for (size_t i=0; substr[i] && i<63; ++i) target[i] = (wchar_t)substr[i];
                 if (wcsstr(lo, target)) {
                     pMon->BindToObject(0,0,IID_IBaseFilter,(void**)&pSrc);
-                    log_ts("Selected device: %S", vName.bstrVal ? vName.bstrVal : L"(unnamed)");
+                    log_ts("Selected device: %S",
+                           (vName.vt == VT_BSTR && vName.bstrVal) ? vName.bstrVal : L"(unnamed)");
                 }
             }
             VariantClear(&vName); VariantClear(&vDev);
@@ -221,6 +328,15 @@ static IBaseFilter* find_dermoscope(const char *substr) {
     }
     pEnumCat->Release();
     return pSrc;
+}
+
+// What DeleteMediaType() does: release pUnk (the media type may carry a COM
+// reference), free pbFormat, then free the struct itself.
+static void free_mt(AM_MEDIA_TYPE *mt) {
+    if (!mt) return;
+    if (mt->pUnk) { mt->pUnk->Release(); mt->pUnk = NULL; }
+    if (mt->cbFormat) { CoTaskMemFree(mt->pbFormat); mt->pbFormat = NULL; mt->cbFormat = 0; }
+    CoTaskMemFree(mt);
 }
 
 // Picks an MJPG media type on the given pin category. If wantW/wantH is very
@@ -233,8 +349,15 @@ static void configure_format(IBaseFilter *pSrc, ICaptureGraphBuilder2 *pBuilder,
     if (FAILED(hr) || !pCfg) return;
 
     int count=0, sz=0;
-    pCfg->GetNumberOfCapabilities(&count, &sz);
-    BYTE *caps = (BYTE*)malloc(sz);
+    HRESULT chr = pCfg->GetNumberOfCapabilities(&count, &sz);
+    if (FAILED(chr) || count <= 0 || sz <= 0) {
+        log_ts("GetNumberOfCapabilities failed: 0x%08lX (count=%d size=%d)",
+               (unsigned long)chr, count, sz);
+        pCfg->Release();
+        return;
+    }
+    BYTE *caps = (BYTE*)malloc((size_t)sz);
+    if (!caps) { pCfg->Release(); return; }
     AM_MEDIA_TYPE *bestMT = NULL;
     int bestW = 0, bestH = 0;
     for (int i = 0; i < count; ++i) {
@@ -249,24 +372,19 @@ static void configure_format(IBaseFilter *pSrc, ICaptureGraphBuilder2 *pBuilder,
                     (w >= wantW && h >= wantH && (bestW < wantW || bestH < wantH || w*h < bestW*bestH)) ||
                     (bestW < wantW && bestH < wantH && w*h > bestW*bestH);
                 if (better) {
-                    if (bestMT) {
-                        if (bestMT->cbFormat) CoTaskMemFree(bestMT->pbFormat);
-                        CoTaskMemFree(bestMT);
-                    }
+                    free_mt(bestMT);
                     bestMT = mt; bestW = w; bestH = h;
                     continue;
                 }
             }
-            if (mt->cbFormat) CoTaskMemFree(mt->pbFormat);
-            CoTaskMemFree(mt);
+            free_mt(mt);
         }
     }
     free(caps);
     if (bestMT) {
         log_ts("Setting format MJPG %dx%d on pin", bestW, bestH);
         pCfg->SetFormat(bestMT);
-        if (bestMT->cbFormat) CoTaskMemFree(bestMT->pbFormat);
-        CoTaskMemFree(bestMT);
+        free_mt(bestMT);
     }
     pCfg->Release();
 }
@@ -287,7 +405,8 @@ static const char INDEX_HTML[] =
 "<h1>Dermoscope helper - test page</h1>\n"
 "<p>Press the hardware button (or F9) to capture a full-res still from <code>/still</code>.</p>\n"
 "<div class=\"row\">\n"
-"  <div class=\"col\"><h2>Live preview</h2><img id=\"live\" src=\"/preview\" /></div>\n"
+"  <div class=\"col\"><h2>Live preview</h2><img id=\"live\" src=\"/preview\" />\n"
+"    <div id=\"liveStatus\" style=\"font-family: monospace; font-size: 0.85em; color: #888; margin-top: 4px;\"></div></div>\n"
 "  <div class=\"col\"><h2>Last capture</h2><canvas id=\"captured\"></canvas>\n"
 "    <div><button id=\"clear\">Clear</button></div></div>\n"
 "</div>\n"
@@ -319,6 +438,23 @@ static const char INDEX_HTML[] =
 "  if (e.key === 'F9' || e.code === 'F9') { e.preventDefault(); capture(); }\n"
 "});\n"
 "document.getElementById('live').addEventListener('click', capture);\n"
+"const liveImg = document.getElementById('live');\n"
+"const liveStatusEl = document.getElementById('liveStatus');\n"
+"let previewUp = true;\n"
+"async function checkPreviewHealth() {\n"
+"  const up = await fetch('/', {cache:'no-store'}).then(r => r.ok).catch(() => false);\n"
+"  if (!up) {\n"
+"    liveStatusEl.textContent = 'Helper stopped -- preview will reconnect automatically once it is running again.';\n"
+"  } else if (!previewUp) {\n"
+"    liveImg.src = '/preview?t=' + Date.now();\n"
+"    liveStatusEl.textContent = 'Reconnected.';\n"
+"  } else {\n"
+"    liveStatusEl.textContent = '';\n"
+"  }\n"
+"  previewUp = up;\n"
+"}\n"
+"checkPreviewHealth();\n"
+"setInterval(checkPreviewHealth, 2000);\n"
 "document.getElementById('clear').addEventListener('click', () => {\n"
 "  const canvas = document.getElementById('captured');\n"
 "  canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);\n"
@@ -327,22 +463,43 @@ static const char INDEX_HTML[] =
 "</script>\n"
 "</body></html>\n";
 
-static void send_all(SOCKET s, const char *buf, int len) {
+static SOCKET g_listenSock = INVALID_SOCKET;
+// Heap-owned on purpose: a file-static std::thread that is still joinable when
+// static destructors run (i.e. the process was killed rather than exited
+// through the message loop) would call std::terminate.
+static std::thread *g_acceptThread = NULL;
+static std::mutex g_clientMu;
+static std::set<SOCKET> g_clientSocks;
+static std::atomic<int> g_clientThreads{0};
+
+// Returns false if the peer went away mid-write; a short send() is retried so
+// a JPEG is never silently truncated.
+static bool send_all(SOCKET s, const char *buf, int len) {
     while (len > 0) {
         int n = send(s, buf, len, 0);
-        if (n <= 0) return;
+        if (n <= 0) return false;
         buf += n; len -= n;
     }
+    return true;
 }
 
-static void serve_client(SOCKET sock) {
+// Handles one request. Never closes the socket -- serve_client() owns that so
+// the close is serialised with the shutdown path's closesocket().
+static void handle_client(SOCKET sock) {
     char buf[4096] = {0};
     int n = recv(sock, buf, sizeof(buf)-1, 0);
-    if (n <= 0) { closesocket(sock); return; }
+    if (n <= 0) return;
     buf[n] = 0;
 
     char method[16] = {0}, path[256] = {0};
     sscanf(buf, "%15s %255s", method, path);
+
+    // Strip a query string before routing: none of our endpoints take
+    // parameters, and callers commonly append one anyway as a cache-buster
+    // (e.g. "/preview?t=123" to force a browser to re-open the stream).
+    // Without this every such request 404s.
+    char *query = strchr(path, '?');
+    if (query) *query = '\0';
 
     if (strcmp(path, "/") == 0 || strcmp(path, "/index.html") == 0) {
         char hdr[256];
@@ -354,7 +511,7 @@ static void serve_client(SOCKET sock) {
             sizeof(INDEX_HTML) - 1);
         send_all(sock, hdr, hlen);
         send_all(sock, INDEX_HTML, sizeof(INDEX_HTML) - 1);
-        closesocket(sock); return;
+        return;
     }
 
     if (strcmp(path, "/preview") == 0) {
@@ -367,27 +524,31 @@ static void serve_client(SOCKET sock) {
             "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
         send_all(sock, hdr, (int)strlen(hdr));
 
-        long long lastSeq = -1;
-        while (g_running) {
+        // Start from the CURRENT sequence number, not -1: with -1 a client that
+        // connects before the first frame arrives would immediately pass the
+        // predicate and emit an empty Content-Length: 0 part.
+        long long lastSeq = g_previewSeq.load();
+        while (g_serverRunning) {
             std::vector<BYTE> frame;
             {
                 std::unique_lock<std::mutex> lk(g_previewMutex);
                 g_previewCV.wait_for(lk, std::chrono::seconds(2),
-                                    [&]{ return g_previewSeq.load() != lastSeq || !g_running; });
-                if (!g_running) break;
+                                    [&]{ return g_previewSeq.load() != lastSeq || !g_serverRunning; });
+                if (!g_serverRunning) break;
                 if (g_previewSeq.load() == lastSeq) continue;
                 frame = g_latestPreview;
                 lastSeq = g_previewSeq.load();
             }
+            if (frame.empty()) continue;      // never emit a zero-byte part
             char part[256];
             int plen = snprintf(part, sizeof(part),
                 "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n",
                 frame.size());
-            if (send(sock, part, plen, 0) <= 0) break;
-            if (send(sock, (const char*)frame.data(), (int)frame.size(), 0) <= 0) break;
-            if (send(sock, "\r\n", 2, 0) <= 0) break;
+            if (!send_all(sock, part, plen)) break;
+            if (!send_all(sock, (const char*)frame.data(), (int)frame.size())) break;
+            if (!send_all(sock, "\r\n", 2)) break;
         }
-        closesocket(sock); return;
+        return;
     }
 
     if (strcmp(path, "/still") == 0) {
@@ -417,7 +578,7 @@ static void serve_client(SOCKET sock) {
             send_all(sock, hdr, hlen);
             send_all(sock, (const char*)frame.data(), (int)frame.size());
         }
-        closesocket(sock); return;
+        return;
     }
 
     const char *resp = "HTTP/1.0 404 Not Found\r\n"
@@ -425,13 +586,104 @@ static void serve_client(SOCKET sock) {
                        "Access-Control-Allow-Origin: *\r\n"
                        "Connection: close\r\n\r\n";
     send_all(sock, resp, (int)strlen(resp));
-    closesocket(sock);
 }
 
-static void http_server(int port) {
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2,2), &wsa);
+static void serve_client(SOCKET sock) {
+    // handle_client can throw (std::bad_alloc copying a 1600x1200 frame). An
+    // exception escaping a detached thread would call std::terminate and would
+    // leak the g_clientThreads count, so every later stop_capture() would burn
+    // its full 2 s drain budget and warn.
+    try {
+        handle_client(sock);
+    } catch (...) {
+        log_ts("HTTP client handler threw; connection dropped.");
+    }
+    // Erase-and-close under the same mutex the shutdown path uses, so a socket
+    // is never closed twice (and a recycled handle is never closed by mistake).
+    {
+        std::lock_guard<std::mutex> lk(g_clientMu);
+        if (g_clientSocks.erase(sock)) closesocket(sock);
+    }
+    g_clientThreads.fetch_sub(1);
+}
+
+static void accept_loop(SOCKET listenSock) {
+    log_ts("HTTP server listening on http://localhost:%d/", g_port);
+    bool fatal = false;
+    while (g_serverRunning) {
+        SOCKET cl = accept(listenSock, NULL, NULL);
+        if (cl == INVALID_SOCKET) {
+            int err = WSAGetLastError();
+            if (!g_serverRunning) break;
+            // A dead listening socket would otherwise spin this loop forever.
+            if (err == WSAENOTSOCK || err == WSAEINVAL || err == WSAEINTR) {
+                fatal = true;
+                break;
+            }
+            // Known-transient: retry straight away. WSAECONNRESET here means a
+            // QUEUED connection was aborted by the peer before we accepted it
+            // (a browser closing a /preview tab mid-load does exactly this) --
+            // the listening socket is perfectly healthy, so treating it as
+            // fatal would kill the server for the life of the process.
+            // Anything else (WSAEMFILE, WSAENOBUFS, ...) is persistent and
+            // would peg a core, so back off.
+            if (err == WSAECONNABORTED || err == WSAECONNRESET || err == WSAEWOULDBLOCK)
+                continue;
+            log_ts("accept() failed: %d; backing off 50ms.", err);
+            Sleep(50);
+            continue;
+        }
+        if (!g_serverRunning) { closesocket(cl); break; }
+        // A client that connects and never sends would otherwise park a thread
+        // and a handle forever, guaranteeing the 2 s give-up path on every stop.
+        DWORD tmo = 5000;
+        setsockopt(cl, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tmo, sizeof(tmo));
+        // /preview is write-only, so recv timeouts alone cannot rescue a thread
+        // parked in send() behind a stalled reader: shutdown() does not unblock
+        // an in-progress send. Keep this below the 2 s drain budget in
+        // http_server_stop() -- send_all() treats n <= 0 as a dead peer.
+        DWORD stmo = 1000;
+        setsockopt(cl, SOL_SOCKET, SO_SNDTIMEO, (const char*)&stmo, sizeof(stmo));
+        {
+            std::lock_guard<std::mutex> lk(g_clientMu);
+            g_clientSocks.insert(cl);
+        }
+        g_clientThreads.fetch_add(1);
+        // Thread creation can throw std::system_error under resource pressure.
+        // Unhandled here it would propagate out of the accept thread and abort
+        // the process with the tray icon registered and the camera still held.
+        try {
+            std::thread(serve_client, cl).detach();
+        } catch (...) {
+            log_ts("Could not spawn HTTP client thread; dropping the connection.");
+            {
+                std::lock_guard<std::mutex> lk(g_clientMu);
+                if (g_clientSocks.erase(cl)) closesocket(cl);
+            }
+            g_clientThreads.fetch_sub(1);
+        }
+    }
+    if (fatal) {
+        // Do not leave the state lying: g_serverRunning true with a dead accept
+        // loop would make the tooltip say "running", grey out Start, and make
+        // both http_server_start() and start_capture() early-return forever.
+        g_serverRunning = false;
+        log_ts("HTTP accept loop hit a fatal socket error; the server is DOWN.");
+        if (g_hwnd) PostMessageW(g_hwnd, WM_SERVERDOWN, 0, 0);
+    }
+    log_ts("HTTP accept loop exited.");
+}
+
+// Creates, binds and listens on the calling thread so a bind failure is a
+// start() failure rather than a silent death inside a detached thread.
+static bool http_server_start(int port) {
+    if (g_serverRunning) return true;
+
     SOCKET srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv == INVALID_SOCKET) {
+        log_ts("socket() failed: %d", WSAGetLastError());
+        return false;
+    }
     BOOL on = 1;
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char*)&on, sizeof(on));
     sockaddr_in addr = {0};
@@ -439,107 +691,886 @@ static void http_server(int port) {
     addr.sin_port = htons((u_short)port);
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (bind(srv, (sockaddr*)&addr, sizeof(addr)) < 0) {
-        log_ts("bind() failed: %d", WSAGetLastError());
+        log_ts("bind() failed on port %d: %d", port, WSAGetLastError());
+        closesocket(srv);
+        return false;
+    }
+    if (listen(srv, 5) < 0) {
+        log_ts("listen() failed on port %d: %d", port, WSAGetLastError());
+        closesocket(srv);
+        return false;
+    }
+    g_listenSock = srv;
+    g_serverRunning = true;
+    g_acceptThread = new std::thread(accept_loop, srv);
+    return true;
+}
+
+static void http_server_stop() {
+    if (!g_serverRunning && g_listenSock == INVALID_SOCKET && !g_acceptThread)
+        return;
+
+    // Store the flag UNDER g_previewMutex: otherwise a /preview thread that has
+    // already evaluated the predicate but not yet parked on the CV misses the
+    // wakeup and sleeps out its full 2 s -- exactly the drain budget below.
+    {
+        std::lock_guard<std::mutex> lk(g_previewMutex);
+        g_serverRunning = false;
+    }
+    g_previewCV.notify_all();
+
+    SOCKET srv = g_listenSock;
+    g_listenSock = INVALID_SOCKET;
+    if (srv != INVALID_SOCKET) closesocket(srv);   // unblocks accept()
+
+    if (g_acceptThread) {
+        if (g_acceptThread->joinable()) g_acceptThread->join();
+        delete g_acceptThread;
+        g_acceptThread = NULL;
+    }
+
+    // Unblock any client parked in recv(), and make every subsequent send() on
+    // these sockets fail so the handlers unwind. shutdown() does NOT abort a
+    // send() that is already in progress -- SO_SNDTIMEO (set in accept_loop) is
+    // what bounds that case.
+    //
+    // shutdown() -- NOT closesocket() -- because the handle must stay allocated:
+    // serve_client still holds the numeric value, and closing here would free it
+    // for reuse, so a later connection could be handed the same number and then
+    // be closed (or written to) by the stale thread. serve_client remains the
+    // single owner of the close, hence g_clientSocks is deliberately not
+    // cleared here.
+    {
+        std::lock_guard<std::mutex> lk(g_clientMu);
+        for (SOCKET s : g_clientSocks) shutdown(s, SD_BOTH);
+    }
+    for (int i = 0; i < 200 && g_clientThreads.load() > 0; ++i) Sleep(10);
+    if (g_clientThreads.load() > 0)
+        log_ts("Warning: %d HTTP client thread(s) still running after 2s.",
+               g_clientThreads.load());
+    log_ts("HTTP server stopped.");
+}
+
+// ---- Capture session ----
+// Everything the running graph owns, in one place, so stop_capture() can reach
+// it. Creation order is top to bottom; teardown releases bottom to top.
+struct CaptureSession {
+    IBaseFilter           *pSrc       = NULL;
+    IGraphBuilder         *pGraph     = NULL;
+    ICaptureGraphBuilder2 *pBuilder   = NULL;
+    IBaseFilter           *pPrevGrab  = NULL;
+    ISampleGrabber_local  *pPrevSG    = NULL;
+    IBaseFilter           *pNullPrev  = NULL;
+    IBaseFilter           *pStillGrab = NULL;
+    ISampleGrabber_local  *pStillSG   = NULL;
+    IBaseFilter           *pNullStill = NULL;
+    IMediaControl         *pMC        = NULL;
+    IMediaEventEx         *pME        = NULL;   // device-loss notifications
+    PreviewCB             *pPrevCB    = NULL;
+    StillCB               *pStillCB   = NULL;
+};
+static CaptureSession g_cap;
+
+static bool is_camera_busy_hr(HRESULT hr) {
+    return hr == HRESULT_FROM_WIN32(ERROR_NO_SYSTEM_RESOURCES);   // 0x800705AA
+}
+
+template <class T> static void safe_release(T *&p) {
+    if (p) { p->Release(); p = NULL; }
+}
+
+// Full teardown. Safe to call when already stopped, and safe to call on a
+// half-built session (start_capture uses it as its failure path).
+static void stop_capture() {
+    bool hadSomething = g_serverRunning || g_listenSock != INVALID_SOCKET ||
+                        g_acceptThread || g_cap.pGraph || g_cap.pSrc;
+
+    // 1. HTTP server first: no new clients, no threads left running.
+    http_server_stop();
+
+    // 2. Detach the callbacks before anything is freed, so no in-flight
+    //    streaming callback can touch a destroyed object. Same reasoning for
+    //    the graph's event notifications: unhook the window BEFORE the release
+    //    below, so no EC_* message can be posted to a window we are tearing
+    //    down (or, worse, to a recycled HWND).
+    if (g_cap.pME)      g_cap.pME->SetNotifyWindow((OAHWND)0, 0, 0);
+    if (g_cap.pStillSG) g_cap.pStillSG->SetCallback(NULL, 1);
+    if (g_cap.pPrevSG)  g_cap.pPrevSG->SetCallback(NULL, 1);
+
+    // 3. Stop the graph and wait for the transition to complete. A wedged USB
+    //    driver can leave GetState returning VFW_S_STATE_INTERMEDIATE (S_FALSE)
+    //    after the 2 s timeout; that must be reported, not papered over with a
+    //    "camera released" line that is not true.
+    bool stoppedClean = true;
+    if (g_cap.pMC) {
+        g_cap.pMC->Stop();
+        OAFilterState fs = State_Stopped;
+        HRESULT shr = g_cap.pMC->GetState(2000, &fs);
+        if (shr != S_OK || fs != State_Stopped) {
+            log_ts("WARNING: graph did not reach Stopped (GetState HR=0x%08lX state=%ld); retrying Stop().",
+                   (unsigned long)shr, (long)fs);
+            g_cap.pMC->Stop();
+            fs = State_Stopped;
+            shr = g_cap.pMC->GetState(2000, &fs);
+            if (shr != S_OK || fs != State_Stopped) {
+                log_ts("WARNING: graph STILL not Stopped (GetState HR=0x%08lX state=%ld); "
+                       "the camera may not have been released.",
+                       (unsigned long)shr, (long)fs);
+                stoppedClean = false;
+            }
+        }
+    }
+
+    // 4. Unhook the filters from the graph.
+    if (g_cap.pGraph) {
+        if (g_cap.pNullStill) g_cap.pGraph->RemoveFilter(g_cap.pNullStill);
+        if (g_cap.pStillGrab) g_cap.pGraph->RemoveFilter(g_cap.pStillGrab);
+        if (g_cap.pNullPrev)  g_cap.pGraph->RemoveFilter(g_cap.pNullPrev);
+        if (g_cap.pPrevGrab)  g_cap.pGraph->RemoveFilter(g_cap.pPrevGrab);
+        if (g_cap.pSrc)       g_cap.pGraph->RemoveFilter(g_cap.pSrc);
+    }
+
+    // 5. Release every interface exactly once, reverse creation order. This is
+    //    what actually hands the camera back to Windows.
+    safe_release(g_cap.pME);
+    safe_release(g_cap.pMC);
+    safe_release(g_cap.pStillSG);
+    safe_release(g_cap.pPrevSG);
+    safe_release(g_cap.pNullStill);
+    safe_release(g_cap.pStillGrab);
+    safe_release(g_cap.pNullPrev);
+    safe_release(g_cap.pPrevGrab);
+    safe_release(g_cap.pBuilder);
+    safe_release(g_cap.pGraph);
+    safe_release(g_cap.pSrc);
+
+    // 6. The qedit SampleGrabber does NOT AddRef the callback object, so its
+    //    lifetime is ours. Delete only after SetCallback(NULL) + full release.
+    delete g_cap.pPrevCB;  g_cap.pPrevCB  = NULL;
+    delete g_cap.pStillCB; g_cap.pStillCB = NULL;
+
+    // 7. Start from a clean slate next time.
+    {
+        std::lock_guard<std::mutex> lk(g_previewMutex);
+        g_latestPreview.clear();
+        g_latestPreview.shrink_to_fit();
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_stillMutex);
+        g_latestStill.clear();
+        g_latestStill.shrink_to_fit();
+    }
+    g_previewSeq.store(0);
+    g_stillSeq.store(0);
+
+    g_state.store(HelperState::Stopped);
+    if (hadSomething && stoppedClean) log_ts("Capture stopped; camera released.");
+}
+
+static HelperState start_fail(HelperState st) {
+    stop_capture();               // tear down whatever was built so far
+    g_state.store(st);
+    return st;
+}
+
+static HelperState start_capture() {
+    if (g_state.load() == HelperState::Running) return HelperState::Running;
+    stop_capture();               // guarantee a clean slate
+
+    log_ts("Looking for dermoscope (vid_ab02)...");
+    g_cap.pSrc = find_dermoscope("vid_ab02");
+    if (!g_cap.pSrc) {
+        log_ts("Device not found.");
+        return start_fail(HelperState::DeviceNotFound);
+    }
+
+    HRESULT hr = CoCreateInstance(CLSID_FilterGraph, NULL, CLSCTX_INPROC_SERVER,
+                                  IID_IGraphBuilder, (void**)&g_cap.pGraph);
+    if (FAILED(hr) || !g_cap.pGraph) {
+        log_ts("CoCreateInstance(FilterGraph) failed: 0x%08lX", (unsigned long)hr);
+        return start_fail(HelperState::Error);
+    }
+    hr = CoCreateInstance(CLSID_CaptureGraphBuilder2, NULL, CLSCTX_INPROC_SERVER,
+                          IID_ICaptureGraphBuilder2, (void**)&g_cap.pBuilder);
+    if (FAILED(hr) || !g_cap.pBuilder) {
+        log_ts("CoCreateInstance(CaptureGraphBuilder2) failed: 0x%08lX", (unsigned long)hr);
+        return start_fail(HelperState::Error);
+    }
+    g_cap.pBuilder->SetFiltergraph(g_cap.pGraph);
+    g_cap.pGraph->AddFilter(g_cap.pSrc, L"Source");
+
+    // Capture pin at 1600x1200 MJPG: live preview + source of /still snapshot.
+    // Still pin at 320x240 MJPG: hardware-button trigger only; bytes discarded.
+    configure_format(g_cap.pSrc, g_cap.pBuilder, &PIN_CATEGORY_CAPTURE, 9999, 9999);
+    configure_format(g_cap.pSrc, g_cap.pBuilder, &PIN_CATEGORY_STILL,    320,  240);
+
+    // Capture pin -> Preview SampleGrabber -> NullRenderer
+    hr = CoCreateInstance(CLSID_SampleGrabber_local, NULL, CLSCTX_INPROC_SERVER,
+                          IID_IBaseFilter, (void**)&g_cap.pPrevGrab);
+    if (FAILED(hr) || !g_cap.pPrevGrab) {
+        log_ts("CoCreateInstance(SampleGrabber/preview) failed: 0x%08lX", (unsigned long)hr);
+        return start_fail(HelperState::Error);
+    }
+    g_cap.pGraph->AddFilter(g_cap.pPrevGrab, L"PreviewGrabber");
+    hr = g_cap.pPrevGrab->QueryInterface(IID_ISampleGrabber_local, (void**)&g_cap.pPrevSG);
+    if (FAILED(hr) || !g_cap.pPrevSG) {
+        log_ts("QueryInterface(ISampleGrabber/preview) failed: 0x%08lX", (unsigned long)hr);
+        return start_fail(HelperState::Error);
+    }
+    AM_MEDIA_TYPE mtMjpg = {0};
+    mtMjpg.majortype = MEDIATYPE_Video;
+    mtMjpg.subtype   = MEDIASUBTYPE_MJPG;
+    g_cap.pPrevSG->SetMediaType(&mtMjpg);
+    g_cap.pPrevSG->SetBufferSamples(FALSE);
+    g_cap.pPrevSG->SetOneShot(FALSE);
+    g_cap.pPrevCB = new PreviewCB();
+    g_cap.pPrevSG->SetCallback(g_cap.pPrevCB, 1);
+
+    hr = CoCreateInstance(CLSID_NullRenderer_local, NULL, CLSCTX_INPROC_SERVER,
+                          IID_IBaseFilter, (void**)&g_cap.pNullPrev);
+    if (FAILED(hr) || !g_cap.pNullPrev) {
+        log_ts("CoCreateInstance(NullRenderer/preview) failed: 0x%08lX", (unsigned long)hr);
+        return start_fail(HelperState::Error);
+    }
+    g_cap.pGraph->AddFilter(g_cap.pNullPrev, L"NullPreview");
+    hr = g_cap.pBuilder->RenderStream(&PIN_CATEGORY_CAPTURE, &MEDIATYPE_Video,
+                                      g_cap.pSrc, g_cap.pPrevGrab, g_cap.pNullPrev);
+    if (FAILED(hr)) {
+        log_ts("RenderStream(CAPTURE) failed: 0x%08lX", (unsigned long)hr);
+        return start_fail(is_camera_busy_hr(hr) ? HelperState::CameraBusy
+                                                : HelperState::Error);
+    }
+
+    // Still pin -> Still SampleGrabber -> NullRenderer
+    hr = CoCreateInstance(CLSID_SampleGrabber_local, NULL, CLSCTX_INPROC_SERVER,
+                          IID_IBaseFilter, (void**)&g_cap.pStillGrab);
+    if (FAILED(hr) || !g_cap.pStillGrab) {
+        log_ts("CoCreateInstance(SampleGrabber/still) failed: 0x%08lX", (unsigned long)hr);
+        return start_fail(HelperState::Error);
+    }
+    g_cap.pGraph->AddFilter(g_cap.pStillGrab, L"StillGrabber");
+    hr = g_cap.pStillGrab->QueryInterface(IID_ISampleGrabber_local, (void**)&g_cap.pStillSG);
+    if (FAILED(hr) || !g_cap.pStillSG) {
+        log_ts("QueryInterface(ISampleGrabber/still) failed: 0x%08lX", (unsigned long)hr);
+        return start_fail(HelperState::Error);
+    }
+    AM_MEDIA_TYPE mtV = {0};
+    mtV.majortype = MEDIATYPE_Video;
+    g_cap.pStillSG->SetMediaType(&mtV);
+    g_cap.pStillSG->SetBufferSamples(FALSE);
+    g_cap.pStillSG->SetOneShot(FALSE);
+    g_cap.pStillCB = new StillCB();
+    g_cap.pStillSG->SetCallback(g_cap.pStillCB, 1);
+
+    hr = CoCreateInstance(CLSID_NullRenderer_local, NULL, CLSCTX_INPROC_SERVER,
+                          IID_IBaseFilter, (void**)&g_cap.pNullStill);
+    if (FAILED(hr) || !g_cap.pNullStill) {
+        log_ts("CoCreateInstance(NullRenderer/still) failed: 0x%08lX", (unsigned long)hr);
+        return start_fail(HelperState::Error);
+    }
+    g_cap.pGraph->AddFilter(g_cap.pNullStill, L"NullStill");
+    hr = g_cap.pBuilder->RenderStream(&PIN_CATEGORY_STILL, &MEDIATYPE_Video,
+                                      g_cap.pSrc, g_cap.pStillGrab, g_cap.pNullStill);
+    if (FAILED(hr)) {
+        // Non-fatal, exactly as before: preview still works, the hardware
+        // button does not.
+        log_ts("RenderStream(STILL) failed: 0x%08lX (button events disabled)", (unsigned long)hr);
+    }
+
+    hr = g_cap.pGraph->QueryInterface(IID_IMediaControl, (void**)&g_cap.pMC);
+    if (FAILED(hr) || !g_cap.pMC) {
+        log_ts("QueryInterface(IMediaControl) failed: 0x%08lX", (unsigned long)hr);
+        return start_fail(HelperState::Error);
+    }
+    hr = g_cap.pMC->Run();
+    log_ts("MediaControl::Run HR=0x%08lX", (unsigned long)hr);
+    if (FAILED(hr)) {
+        if (is_camera_busy_hr(hr))
+            log_ts("Camera is in use by another application (ERROR_NO_SYSTEM_RESOURCES).");
+        return start_fail(is_camera_busy_hr(hr) ? HelperState::CameraBusy
+                                                : HelperState::Error);
+    }
+
+    // Run() legitimately returns S_FALSE (0x00000001) on this device while the
+    // graph is still transitioning -- that is NOT a failure, so GetState is the
+    // arbiter. Without this check a graph that never reaches Running would
+    // still light up the tooltip, grey out Start and kill the retry timer.
+    OAFilterState fs = State_Stopped;
+    HRESULT ghr = g_cap.pMC->GetState(2000, &fs);
+    log_ts("Graph state: %ld (2=Running)", (long)fs);
+    if (ghr != S_OK || fs != State_Running) {
+        log_ts("Graph did not reach Running (GetState HR=0x%08lX state=%ld).",
+               (unsigned long)ghr, (long)fs);
+        return start_fail(is_camera_busy_hr(ghr) ? HelperState::CameraBusy
+                                                 : HelperState::Error);
+    }
+
+    // Device-loss detection. Purely additive: if any of this fails we simply
+    // lose the unplug notification, exactly as before.
+    HRESULT ehr = g_cap.pGraph->QueryInterface(IID_IMediaEventEx, (void**)&g_cap.pME);
+    if (SUCCEEDED(ehr) && g_cap.pME && g_hwnd) {
+        g_cap.pME->SetNotifyWindow((OAHWND)g_hwnd, WM_GRAPHEVENT, 0);
+    } else {
+        log_ts("IMediaEventEx unavailable (0x%08lX); device-loss detection is off.",
+               (unsigned long)ehr);
+        safe_release(g_cap.pME);
+    }
+
+    if (!http_server_start(g_port)) {
+        return start_fail(HelperState::Error);
+    }
+
+    g_state.store(HelperState::Running);
+    log_ts("Helper ready. Open http://localhost:%d/ in your browser.", g_port);
+    log_ts("Hardware button -> F9 -> web app fetches /still.");
+    return HelperState::Running;
+}
+
+// ---- Tray icon ----
+static HICON g_iconColor   = NULL;   // resource 101 if present, else IDI_APPLICATION
+static HICON g_iconGrey    = NULL;   // desaturated variant; may be NULL
+static bool  g_iconGreyOwned = false;
+static UINT  g_wmTaskbarCreated  = 0;
+static UINT  g_wmAlreadyRunning  = 0;
+static NOTIFYICONDATAW g_nid = {};
+static bool  g_iconAdded   = false;
+static bool  g_shutdownDone = false;
+static std::atomic<bool> g_cleanExitDone{false};
+
+static const wchar_t* state_tip(HelperState s) {
+    switch (s) {
+        case HelperState::Running:        return L"Dermoscope Helper: running";
+        case HelperState::DeviceNotFound: return L"Dermoscope Helper: device not found";
+        case HelperState::CameraBusy:     return L"Dermoscope Helper: camera busy";
+        case HelperState::Error:          return L"Dermoscope Helper: error";
+        default:                          return L"Dermoscope Helper: stopped";
+    }
+}
+
+// Renders the icon into a 32bpp top-down DIB, desaturates RGB (alpha kept) and
+// rebuilds it. Every step is checked; on any failure we return NULL and the
+// caller simply uses the colour icon for both states.
+//
+// The four GDI entry points are bound at runtime rather than at link time:
+// gdi32 is not in mingw's default library list and the Makefile is off limits.
+// gdi32.dll is present on every Windows install (user32 depends on it), so
+// this only ever costs a GetProcAddress; if anything is missing we bail out
+// and the tray simply uses one icon for every state.
+typedef int     (WINAPI *PFN_GetObjectW)(HANDLE, int, LPVOID);
+typedef int     (WINAPI *PFN_GetDIBits)(HDC, HBITMAP, UINT, UINT, LPVOID, LPBITMAPINFO, UINT);
+typedef HBITMAP (WINAPI *PFN_CreateDIBSection)(HDC, const BITMAPINFO*, UINT, void**, HANDLE, DWORD);
+typedef BOOL    (WINAPI *PFN_DeleteObject)(HGDIOBJ);
+
+static HICON make_grey_icon(HICON src) {
+    if (!src) return NULL;
+
+    HMODULE gdi = LoadLibraryW(L"gdi32.dll");
+    if (!gdi) return NULL;
+    PFN_GetObjectW       pGetObject   = (PFN_GetObjectW)      (void*)GetProcAddress(gdi, "GetObjectW");
+    PFN_GetDIBits        pGetDIBits   = (PFN_GetDIBits)       (void*)GetProcAddress(gdi, "GetDIBits");
+    PFN_CreateDIBSection pCreateDIB   = (PFN_CreateDIBSection)(void*)GetProcAddress(gdi, "CreateDIBSection");
+    PFN_DeleteObject     pDeleteObject= (PFN_DeleteObject)    (void*)GetProcAddress(gdi, "DeleteObject");
+    if (!pGetObject || !pGetDIBits || !pCreateDIB || !pDeleteObject) {
+        FreeLibrary(gdi);
+        return NULL;
+    }
+
+    ICONINFO ii = {};
+    if (!GetIconInfo(src, &ii)) { FreeLibrary(gdi); return NULL; }
+
+    HICON out = NULL;
+    HDC hdc = GetDC(NULL);
+    BITMAP bm = {};
+    if (hdc && ii.hbmColor && ii.hbmMask &&
+        pGetObject(ii.hbmColor, sizeof(bm), &bm) &&
+        bm.bmWidth > 0 && bm.bmHeight > 0 && bm.bmWidth <= 512 && bm.bmHeight <= 512) {
+        BITMAPINFO bi = {};
+        bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth       = bm.bmWidth;
+        bi.bmiHeader.biHeight      = -bm.bmHeight;   // top-down
+        bi.bmiHeader.biPlanes      = 1;
+        bi.bmiHeader.biBitCount    = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        size_t px = (size_t)bm.bmWidth * (size_t)bm.bmHeight;
+        std::vector<BYTE> bits(px * 4, 0);
+        if (pGetDIBits(hdc, ii.hbmColor, 0, (UINT)bm.bmHeight,
+                       bits.data(), &bi, DIB_RGB_COLORS)) {
+            for (size_t i = 0; i < px; ++i) {
+                BYTE b = bits[i*4 + 0], g = bits[i*4 + 1], r = bits[i*4 + 2];
+                BYTE y = (BYTE)(((unsigned)r * 54 + (unsigned)g * 183 + (unsigned)b * 19) >> 8);
+                bits[i*4 + 0] = bits[i*4 + 1] = bits[i*4 + 2] = y;   // alpha untouched
+            }
+            void *dst = NULL;
+            HBITMAP hNew = pCreateDIB(hdc, &bi, DIB_RGB_COLORS, &dst, NULL, 0);
+            if (hNew && dst) {
+                memcpy(dst, bits.data(), px * 4);
+                ICONINFO ni = {};
+                ni.fIcon    = TRUE;
+                ni.hbmColor = hNew;
+                ni.hbmMask  = ii.hbmMask;
+                out = CreateIconIndirect(&ni);
+            }
+            if (hNew) pDeleteObject(hNew);
+        }
+    }
+    if (hdc) ReleaseDC(NULL, hdc);
+    if (ii.hbmColor) pDeleteObject(ii.hbmColor);
+    if (ii.hbmMask)  pDeleteObject(ii.hbmMask);
+    FreeLibrary(gdi);
+    return out;
+}
+
+static void load_icons() {
+    HICON h = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(101));
+    if (!h) h = LoadIcon(NULL, IDI_APPLICATION);
+    g_iconColor = h;
+    g_iconGrey  = make_grey_icon(h);
+    g_iconGreyOwned = (g_iconGrey != NULL);
+    if (!g_iconGrey) g_iconGrey = g_iconColor;
+}
+
+static void tray_update() {
+    if (!g_iconAdded) return;
+    HelperState s = g_state.load();
+    g_nid.uFlags  = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+    g_nid.hIcon   = (s == HelperState::Running) ? g_iconColor : g_iconGrey;
+    wcsncpy(g_nid.szTip, state_tip(s), 127);
+    g_nid.szTip[127] = 0;
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+}
+
+static void tray_add() {
+    ZeroMemory(&g_nid, sizeof(g_nid));
+    g_nid.cbSize           = sizeof(g_nid);
+    g_nid.hWnd             = g_hwnd;
+    g_nid.uID              = TRAY_UID;
+    g_nid.uFlags           = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+    g_nid.uCallbackMessage = WM_TRAYICON;
+    g_nid.hIcon            = (g_state.load() == HelperState::Running) ? g_iconColor : g_iconGrey;
+    wcsncpy(g_nid.szTip, state_tip(g_state.load()), 127);
+    g_nid.szTip[127] = 0;
+    g_iconAdded = (Shell_NotifyIconW(NIM_ADD, &g_nid) != FALSE);
+    if (!g_iconAdded) log_ts("Shell_NotifyIcon(NIM_ADD) failed: %lu", GetLastError());
+}
+
+// TaskbarCreated is broadcast to TOP-LEVEL windows only, so our message-only
+// window never learns that Explorer restarted and took the icon with it. Poll
+// instead: NIM_MODIFY fails once the icon is gone. Also re-drives NIM_ADD if it
+// failed earlier, so a transient shell hiccup does not leave a camera-holding
+// process with no UI at all.
+static void tray_health_check() {
+    if (g_shutdownDone) return;
+    if (!g_iconAdded) {
+        tray_add();
+        if (g_iconAdded) log_ts("Tray icon (re-)added.");
         return;
     }
-    listen(srv, 5);
-    log_ts("HTTP server listening on http://localhost:%d/", port);
-    while (g_running) {
-        SOCKET cl = accept(srv, NULL, NULL);
-        if (cl == INVALID_SOCKET) continue;
-        std::thread(serve_client, cl).detach();
+    g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+    if (!Shell_NotifyIconW(NIM_MODIFY, &g_nid)) {
+        log_ts("Tray icon has disappeared (NIM_MODIFY failed); re-adding.");
+        g_iconAdded = false;
+        tray_add();
+    }
+}
+
+static void tray_balloon(const wchar_t *title, const wchar_t *text) {
+    if (!g_iconAdded) return;
+    NOTIFYICONDATAW nid = g_nid;
+    nid.uFlags      = NIF_INFO;
+    nid.dwInfoFlags = NIIF_INFO;
+    wcsncpy(nid.szInfoTitle, title, 63); nid.szInfoTitle[63] = 0;
+    wcsncpy(nid.szInfo,      text, 255); nid.szInfo[255]     = 0;
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
+static void balloon_for_state(HelperState s) {
+    wchar_t msg[256];
+    switch (s) {
+        case HelperState::Running:
+            _snwprintf(msg, 255, L"Capture running. Test page: http://localhost:%d/", g_port);
+            msg[255] = 0;
+            tray_balloon(L"Dermoscope Helper", msg);
+            break;
+        case HelperState::DeviceNotFound:
+            tray_balloon(L"Dermoscope Helper",
+                         L"Dermoscope not found. Plug it in - retrying automatically.");
+            break;
+        case HelperState::CameraBusy:
+            tray_balloon(L"Dermoscope Helper",
+                         L"Camera is in use by another application. Close it and press Start.");
+            break;
+        case HelperState::Error:
+            tray_balloon(L"Dermoscope Helper",
+                         L"Failed to start. See helper.log next to helper.exe.");
+            break;
+        default:
+            tray_balloon(L"Dermoscope Helper", L"Capture stopped. The camera is free.");
+            break;
+    }
+}
+
+// Auto-retry exists only for DeviceNotFound (waiting for the user to plug the
+// dermoscope in). We never auto-retry CameraBusy -- that would fight whatever
+// app currently owns the camera -- nor after an explicit Stop.
+static void retry_timer_set(bool on) {
+    if (!g_hwnd) return;
+    if (on) SetTimer(g_hwnd, IDT_RETRY, RETRY_INTERVAL_MS, NULL);
+    else    KillTimer(g_hwnd, IDT_RETRY);
+}
+
+// start/stop block the message loop for seconds. Clicks the user made during
+// that window are dispatched afterwards, against the NEW state -- so clicks
+// queued during a Stop would call do_start() and snatch the camera straight
+// back from whatever app the user was releasing it for (and vice versa).
+// Discard tray input that arrived while we were busy; the user's intent was
+// expressed by the click we already acted on.
+static void drain_tray_input() {
+    if (!g_hwnd) return;
+    MSG m;
+    while (PeekMessageW(&m, g_hwnd, WM_TRAYICON, WM_TRAYICON, PM_REMOVE)) {}
+}
+
+static void do_start(bool balloon) {
+    // Shutdown is final: never rebuild the graph once teardown has begun.
+    if (g_shutdownDone) return;
+    HelperState s = start_capture();
+    tray_update();
+    if (balloon) balloon_for_state(s);
+    retry_timer_set(s == HelperState::DeviceNotFound);
+    drain_tray_input();
+}
+
+static void do_stop(bool balloon) {
+    retry_timer_set(false);
+    stop_capture();
+    tray_update();
+    if (balloon) balloon_for_state(HelperState::Stopped);
+    drain_tray_input();
+}
+
+static void tray_shutdown() {
+    if (g_shutdownDone) return;
+    g_shutdownDone = true;
+    retry_timer_set(false);
+    if (g_hwnd) KillTimer(g_hwnd, IDT_ICONCHECK);
+    // Remove the icon FIRST: stop_capture() takes seconds, and an icon that is
+    // still clickable during teardown just queues messages we have to discard.
+    if (g_iconAdded) {
+        Shell_NotifyIconW(NIM_DELETE, &g_nid);
+        g_iconAdded = false;
+    }
+    stop_capture();
+}
+
+static void show_menu(HWND hwnd) {
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    bool running = (g_state.load() == HelperState::Running);
+    AppendMenuW(menu, MF_STRING, IDM_START,    L"Start");
+    AppendMenuW(menu, MF_STRING, IDM_STOP,     L"Stop");
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING, IDM_OPENPAGE, L"Open test page");
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING, IDM_EXIT,     L"Exit");
+    EnableMenuItem(menu, IDM_START, MF_BYCOMMAND | (running ? MF_GRAYED : MF_ENABLED));
+    EnableMenuItem(menu, IDM_STOP,  MF_BYCOMMAND | (running ? MF_ENABLED : MF_GRAYED));
+
+    POINT pt; GetCursorPos(&pt);
+    SetForegroundWindow(hwnd);                    // standard tray-menu workaround
+    int cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                             pt.x, pt.y, 0, hwnd, NULL);
+    PostMessage(hwnd, WM_NULL, 0, 0);             // ...and its other half
+    DestroyMenu(menu);
+
+    switch (cmd) {
+        case IDM_START: do_start(true); break;
+        case IDM_STOP:  do_stop(true);  break;
+        case IDM_OPENPAGE: {
+            wchar_t url[64];
+            _snwprintf(url, 63, L"http://localhost:%d/", g_port);
+            url[63] = 0;
+            ShellExecuteW(NULL, L"open", url, NULL, NULL, SW_SHOWNORMAL);
+            break;
+        }
+        case IDM_EXIT:
+            // DestroyWindow (not a bare tray_shutdown + PostQuitMessage): it
+            // sends WM_DESTROY, which does the shutdown, and it takes the window
+            // out of the message queue so nothing queued during the multi-second
+            // teardown can be dispatched afterwards and restart capture.
+            DestroyWindow(hwnd);
+            break;
+        default: break;
+    }
+}
+
+static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == g_wmTaskbarCreated && g_wmTaskbarCreated != 0) {
+        // Explorer restarted -- our icon went with it. A message-only window is
+        // NOT in the broadcast set, so in practice IDT_ICONCHECK is what
+        // notices; this stays for correctness if the window type ever changes.
+        if (g_shutdownDone) return 0;
+        g_iconAdded = false;
+        tray_add();
+        return 0;
+    }
+    if (msg == g_wmAlreadyRunning && g_wmAlreadyRunning != 0) {
+        tray_balloon(L"Dermoscope Helper", L"Dermoscope Helper is already running.");
+        return 0;
+    }
+    if (msg == WM_SERVERDOWN) {
+        if (g_shutdownDone) return 0;
+        // The accept loop died and already cleared g_serverRunning. Say so,
+        // so Start is offered again instead of a tooltip that claims "running".
+        g_state.store(HelperState::Error);
+        tray_update();
+        tray_balloon(L"Dermoscope Helper",
+                     L"The local HTTP server stopped unexpectedly. "
+                     L"Press Start to restart it; see helper.log.");
+        return 0;
+    }
+    if (msg == WM_GRAPHEVENT) {
+        if (g_shutdownDone) return 0;
+        IMediaEventEx *pME = g_cap.pME;
+        if (!pME) return 0;
+        bool lost = false;
+        long evCode = 0;
+        LONG_PTR p1 = 0, p2 = 0;
+        // Must drain fully: the graph only posts another WM_GRAPHEVENT once the
+        // queue has been emptied.
+        while (SUCCEEDED(pME->GetEvent(&evCode, &p1, &p2, 0))) {
+            // EC_DEVICE_LOST also carries lParam2 == 1 for "the device is back",
+            // but only for filters registered via IAMDeviceRemoval, which we are
+            // not. Treating every EC_DEVICE_LOST as a loss therefore fails safe:
+            // a spurious stop re-arms the retry timer and recovers by itself,
+            // whereas a missed removal leaves the tooltip lying -- the exact bug
+            // this handler exists to fix.
+            if (evCode == EC_DEVICE_LOST || evCode == EC_ERRORABORT) {
+                log_ts("DirectShow event 0x%02lX (device lost / abort).", (unsigned long)evCode);
+                lost = true;
+            }
+            pME->FreeEventParams(evCode, p1, p2);
+        }
+        if (lost) {
+            log_ts("Dermoscope disappeared while running; stopping and waiting for it to return.");
+            stop_capture();                          // releases pME too
+            g_state.store(HelperState::DeviceNotFound);
+            tray_update();
+            balloon_for_state(HelperState::DeviceNotFound);
+            retry_timer_set(true);                   // so replugging recovers
+        }
+        return 0;
+    }
+
+    switch (msg) {
+        case WM_TRAYICON:
+            if (g_shutdownDone) return 0;   // shutdown is final
+            if (LOWORD(lp) == WM_RBUTTONUP) {
+                show_menu(hwnd);
+            } else if (LOWORD(lp) == WM_LBUTTONDBLCLK) {
+                if (g_state.load() == HelperState::Running) do_stop(true);
+                else                                        do_start(true);
+            }
+            return 0;
+
+        case WM_TIMER:
+            if (g_shutdownDone) return 0;   // shutdown is final
+            if (wp == IDT_ICONCHECK) {
+                tray_health_check();
+                return 0;
+            }
+            if (wp == IDT_RETRY) {
+                if (g_state.load() != HelperState::DeviceNotFound) {
+                    retry_timer_set(false);
+                    return 0;
+                }
+                log_ts("Auto-retry: looking for the dermoscope again...");
+                HelperState s = start_capture();
+                tray_update();
+                if (s != HelperState::DeviceNotFound) {
+                    retry_timer_set(false);
+                    balloon_for_state(s);   // only the outcome, never each attempt
+                }
+                return 0;
+            }
+            break;
+
+        case WM_CLOSE:
+            tray_shutdown();
+            DestroyWindow(hwnd);
+            return 0;
+
+        case WM_ENDSESSION:
+            if (wp) {                       // session really is ending
+                tray_shutdown();
+                g_cleanExitDone.store(true);
+                PostQuitMessage(0);         // unwind rather than wait to be killed
+            }
+            return 0;
+
+        case WM_DESTROY:
+            tray_shutdown();
+            PostQuitMessage(0);
+            return 0;
+
+        default: break;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// Console mode only: Ctrl-C / console close must release the camera instead of
+// hard-killing us, so we post WM_CLOSE and let the message loop unwind.
+static BOOL WINAPI console_ctrl_handler(DWORD type) {
+    switch (type) {
+        case CTRL_C_EVENT:
+        case CTRL_BREAK_EVENT:
+        case CTRL_CLOSE_EVENT:
+        case CTRL_LOGOFF_EVENT:
+        case CTRL_SHUTDOWN_EVENT:
+            if (g_hwnd) PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+            // The system may terminate us as soon as we return for the
+            // close/logoff/shutdown events; give the clean exit a moment.
+            for (int i = 0; i < 400 && !g_cleanExitDone.load(); ++i) Sleep(10);
+            return TRUE;
+        default:
+            return FALSE;
     }
 }
 
 int main(int argc, char **argv) {
-    int port = (argc > 1) ? atoi(argv[1]) : 8080;
-    if (argc > 2) g_debounce_ms = (DWORD)atoi(argv[2]);
-    log_ts("Config: port=%d debounce_ms=%lu", port, g_debounce_ms);
+    // Positional args as before (port, debounce_ms); flags may appear anywhere
+    // and never consume a positional slot. Unknown --flags are ignored.
+    bool consoleMode = false;
+    bool badDebounce = false;     // logged once the log destination is known
+    int positional = 0;
+    for (int i = 1; i < argc; ++i) {
+        if (argv[i][0] == '-' && argv[i][1] == '-') {
+            if (strcmp(argv[i], "--console") == 0) consoleMode = true;
+            continue;
+        }
+        if (positional == 0) {
+            g_port = atoi(argv[i]);
+        } else if (positional == 1) {
+            // Validate like the port next to it. A negative value cast straight
+            // to DWORD wraps to a ~49-day debounce, which silently disables the
+            // hardware button for good while the tooltip still says "running".
+            char *end = NULL;
+            long d = strtol(argv[i], &end, 10);
+            if (end != argv[i] && d >= 0 && d <= 60000) g_debounce_ms = (DWORD)d;
+            else badDebounce = true;
+        }
+        ++positional;
+    }
+    if (g_port <= 0 || g_port > 65535) g_port = 8080;
+
+    g_wmTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+    g_wmAlreadyRunning = RegisterWindowMessageW(L"DermoscopeHelperAlreadyRunning");
+
+    // Single instance. Local\ is right: SendInput is per-session anyway.
+    HANDLE hMutex = CreateMutexW(NULL, TRUE, L"Local\\DermoscopeHelperSingleInstance");
+    if (hMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND other = FindWindowExW(HWND_MESSAGE, NULL, TRAY_WND_CLASS, NULL);
+        if (other) PostMessageW(other, g_wmAlreadyRunning, 0, 0);
+        CloseHandle(hMutex);
+        return 0;
+    }
+
+    if (consoleMode) {
+        g_logFp = stderr;
+    } else {
+        FreeConsole();            // stderr's handle is dead from here on
+        open_log_file();
+    }
+    log_ts("Config: port=%d debounce_ms=%lu mode=%s",
+           g_port, g_debounce_ms, consoleMode ? "console" : "tray");
+    if (badDebounce)
+        log_ts("Ignored an out-of-range debounce_ms argument (allowed 0..60000); "
+               "using %lu.", g_debounce_ms);
+
+    WSADATA wsa;
+    int wsaErr = WSAStartup(MAKEWORD(2,2), &wsa);
+    if (wsaErr != 0) {
+        // Without Winsock there is no HTTP server, so there is nothing useful to
+        // run -- and WSACleanup() must not be called for a failed WSAStartup().
+        log_ts("WSAStartup failed: %d -- cannot serve HTTP; exiting.", wsaErr);
+        if (hMutex) { ReleaseMutex(hMutex); CloseHandle(hMutex); }
+        return 2;
+    }
 
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
-    log_ts("Looking for dermoscope (vid_ab02)...");
-    IBaseFilter *pSrc = find_dermoscope("vid_ab02");
-    if (!pSrc) { log_ts("Device not found."); return 1; }
+    WNDCLASSEXW wc = {};
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = wnd_proc;
+    wc.hInstance     = GetModuleHandleW(NULL);
+    wc.lpszClassName = TRAY_WND_CLASS;
+    RegisterClassExW(&wc);
+    g_hwnd = CreateWindowExW(0, TRAY_WND_CLASS, L"Dermoscope Helper", 0,
+                             0, 0, 0, 0, HWND_MESSAGE, NULL, wc.hInstance, NULL);
+    if (!g_hwnd) {
+        log_ts("CreateWindowEx failed: %lu", GetLastError());
+        WSACleanup();
+        CoUninitialize();
+        if (hMutex) { ReleaseMutex(hMutex); CloseHandle(hMutex); }
+        return 3;
+    }
 
-    IGraphBuilder *pGraph = NULL;
-    CoCreateInstance(CLSID_FilterGraph, NULL, CLSCTX_INPROC_SERVER,
-                     IID_IGraphBuilder, (void**)&pGraph);
-    ICaptureGraphBuilder2 *pBuilder = NULL;
-    CoCreateInstance(CLSID_CaptureGraphBuilder2, NULL, CLSCTX_INPROC_SERVER,
-                     IID_ICaptureGraphBuilder2, (void**)&pBuilder);
-    pBuilder->SetFiltergraph(pGraph);
-    pGraph->AddFilter(pSrc, L"Source");
+    load_icons();
+    tray_add();
+    // Without an icon there is no menu, no Stop and no Exit -- the helper would
+    // hold the camera and the port invisibly, unkillable except via Task
+    // Manager and unrelaunchable because of the single-instance mutex. Retry a
+    // few times (the shell can be briefly unready at logon), then refuse to run
+    // rather than auto-start blind.
+    for (int i = 0; i < 5 && !g_iconAdded; ++i) {
+        Sleep(1000);
+        tray_add();
+    }
+    if (!g_iconAdded) {
+        log_ts("Could not add the tray icon after 6 attempts; refusing to run "
+               "invisibly while holding the camera. Exiting.");
+        DestroyWindow(g_hwnd);
+        g_hwnd = NULL;
+        if (g_iconGreyOwned && g_iconGrey) DestroyIcon(g_iconGrey);
+        g_iconGrey = NULL;
+        WSACleanup();
+        CoUninitialize();
+        if (hMutex) { ReleaseMutex(hMutex); CloseHandle(hMutex); }
+        return 4;
+    }
+    SetTimer(g_hwnd, IDT_ICONCHECK, ICON_CHECK_INTERVAL_MS, NULL);
 
-    // Capture pin at 1600x1200 MJPG: live preview + source of /still snapshot.
-    // Still pin at 320x240 MJPG: hardware-button trigger only; bytes discarded.
-    configure_format(pSrc, pBuilder, &PIN_CATEGORY_CAPTURE, 9999, 9999);
-    configure_format(pSrc, pBuilder, &PIN_CATEGORY_STILL,    320,  240);
+    if (consoleMode) SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
 
-    // Capture pin -> Preview SampleGrabber -> NullRenderer
-    IBaseFilter *pPrevGrab = NULL;
-    CoCreateInstance(CLSID_SampleGrabber_local, NULL, CLSCTX_INPROC_SERVER,
-                     IID_IBaseFilter, (void**)&pPrevGrab);
-    pGraph->AddFilter(pPrevGrab, L"PreviewGrabber");
-    ISampleGrabber_local *pPrevSG = NULL;
-    pPrevGrab->QueryInterface(IID_ISampleGrabber_local, (void**)&pPrevSG);
-    AM_MEDIA_TYPE mtMjpg = {0};
-    mtMjpg.majortype = MEDIATYPE_Video;
-    mtMjpg.subtype   = MEDIASUBTYPE_MJPG;
-    pPrevSG->SetMediaType(&mtMjpg);
-    pPrevSG->SetBufferSamples(FALSE);
-    pPrevSG->SetOneShot(FALSE);
-    PreviewCB *pPrevCB = new PreviewCB();
-    pPrevSG->SetCallback(pPrevCB, 1);
+    do_start(true);               // auto-start; balloon reports the outcome
 
-    IBaseFilter *pNullPrev = NULL;
-    CoCreateInstance(CLSID_NullRenderer_local, NULL, CLSCTX_INPROC_SERVER,
-                     IID_IBaseFilter, (void**)&pNullPrev);
-    pGraph->AddFilter(pNullPrev, L"NullPreview");
-    HRESULT hr = pBuilder->RenderStream(&PIN_CATEGORY_CAPTURE, &MEDIATYPE_Video,
-                                        pSrc, pPrevGrab, pNullPrev);
-    if (FAILED(hr)) { log_ts("RenderStream(CAPTURE) failed: 0x%08lX", (unsigned long)hr); return 2; }
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
 
-    // Still pin -> Still SampleGrabber -> NullRenderer
-    IBaseFilter *pStillGrab = NULL;
-    CoCreateInstance(CLSID_SampleGrabber_local, NULL, CLSCTX_INPROC_SERVER,
-                     IID_IBaseFilter, (void**)&pStillGrab);
-    pGraph->AddFilter(pStillGrab, L"StillGrabber");
-    ISampleGrabber_local *pStillSG = NULL;
-    pStillGrab->QueryInterface(IID_ISampleGrabber_local, (void**)&pStillSG);
-    AM_MEDIA_TYPE mtV = {0};
-    mtV.majortype = MEDIATYPE_Video;
-    pStillSG->SetMediaType(&mtV);
-    pStillSG->SetBufferSamples(FALSE);
-    pStillSG->SetOneShot(FALSE);
-    StillCB *pStillCB = new StillCB();
-    pStillSG->SetCallback(pStillCB, 1);
+    tray_shutdown();              // no-op if the window already did it
 
-    IBaseFilter *pNullStill = NULL;
-    CoCreateInstance(CLSID_NullRenderer_local, NULL, CLSCTX_INPROC_SERVER,
-                     IID_IBaseFilter, (void**)&pNullStill);
-    pGraph->AddFilter(pNullStill, L"NullStill");
-    hr = pBuilder->RenderStream(&PIN_CATEGORY_STILL, &MEDIATYPE_Video,
-                                pSrc, pStillGrab, pNullStill);
-    if (FAILED(hr)) { log_ts("RenderStream(STILL) failed: 0x%08lX (button events disabled)", (unsigned long)hr); }
+    // If the 2 s drain gave up, a detached client thread is still alive. Letting
+    // main return would run static destructors on g_clientMu, g_clientSocks and
+    // the log FILE* while that thread is still using all three -- undefined
+    // behaviour, i.e. a crash or hang on exit. Everything that matters (camera
+    // released, icon removed) has already happened in tray_shutdown(), and
+    // log_ts flushes every line, so ending the process outright is safe and
+    // strictly better than the race.
+    if (g_clientThreads.load() > 0) {
+        log_ts("Exiting with %d HTTP client thread(s) still live; "
+               "ending the process without static teardown.", g_clientThreads.load());
+        if (hMutex) CloseHandle(hMutex);   // the kernel drops the mutex with us
+        _exit(0);
+    }
 
-    IMediaControl *pMC = NULL;
-    pGraph->QueryInterface(IID_IMediaControl, (void**)&pMC);
-    hr = pMC->Run();
-    log_ts("MediaControl::Run HR=0x%08lX", (unsigned long)hr);
-
-    OAFilterState fs = State_Stopped;
-    pMC->GetState(2000, &fs);
-    log_ts("Graph state: %ld (2=Running)", fs);
-
-    std::thread server(http_server, port);
-    server.detach();
-
-    log_ts("Helper ready. Open http://localhost:%d/ in your browser.", port);
-    log_ts("Hardware button -> F9 -> web app fetches /still. Ctrl-C to quit.");
-
-    while (g_running) Sleep(1000);
-
-    pMC->Stop();
+    if (g_iconGreyOwned && g_iconGrey) DestroyIcon(g_iconGrey);
+    g_iconGrey = NULL;
+    WSACleanup();
+    CoUninitialize();
+    if (hMutex) { ReleaseMutex(hMutex); CloseHandle(hMutex); }
+    g_cleanExitDone.store(true);
+    log_ts("Exited cleanly.");
     return 0;
 }
