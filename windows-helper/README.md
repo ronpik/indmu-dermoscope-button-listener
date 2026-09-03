@@ -19,6 +19,7 @@ This is the **working Windows path** produced by the investigation documented in
                                             │ HTTP server (:8080)   │
                                             │ GET  /preview  (MJPEG)│
                                             │ GET  /still    (JPEG) │
+                                            │ GET  /health   (JSON) │
                                             │ GET  /         (HTML) │
                                             └───────────┬───────────┘
                                                         │  localhost
@@ -356,20 +357,59 @@ Query strings on any endpoint are accepted and ignored (stripped before routing)
 
 ### `GET /still`
 
-Returns the **most recent full-resolution JPEG** snapshot — a copy of the preview frame that was live at the moment the user pressed the hardware button. Content type is `image/jpeg`. Resolution matches the preview (1600×1200 unless you've edited the source). If no button has been pressed yet, returns `404`.
+Returns the **most recent full-resolution JPEG** snapshot — a copy of the preview frame that was live at the moment the user pressed the hardware button. Content type is `image/jpeg`. Resolution matches the preview (1600×1200 unless you've edited the source). If no button has been pressed yet this session, returns **`204 No Content`** (empty body) — **not** `404`. (Prior to the `/health` endpoint below, this returned `404`; that was a breaking change for any client keying off `404` specifically — see `still_available` on `/health` if you need to check without triggering a fetch of nothing.)
 
 Implementation note: this is *not* a still-pin frame — DirectShow's Still pin on this device is used only as the click trigger and kept at 320×240 (its bytes are discarded). For capture quality we snapshot the high-res preview-pin frame at trigger time and serve that.
 
 ```js
 // After receiving F9 (button-click-driven):
 const resp = await fetch('http://localhost:8080/still', { cache: 'no-store' });
-const blob = await resp.blob();
-const img = new Image();
-img.src = URL.createObjectURL(blob);
-// img is 1600x1200 JPEG by default
+if (resp.status === 204) { /* nothing captured yet this session */ }
+else if (resp.ok) {
+  const blob = await resp.blob();
+  const img = new Image();
+  img.src = URL.createObjectURL(blob);
+  // img is 1600x1200 JPEG by default
+}
 ```
 
 Response includes `Access-Control-Allow-Origin: *`.
+
+### `GET /health`
+
+Returns `200 application/json` whenever the helper's HTTP server is up — the right endpoint for a web app to detect "is the helper running", as opposed to `/still`'s "has anything been captured".
+
+```json
+{
+  "status": "running",
+  "version": "1.2.3",
+  "device": "USB Camera",
+  "preview_frames": 4821,
+  "still_seq": 3,
+  "still_available": true,
+  "port": 8080,
+  "uptime_s": 57
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `status` | Always `"running"` — the HTTP server (and so `/health`) exists only while capture is running; when the helper is stopped or not running, the connection is refused instead of returning a different `status` value. |
+| `version` | The stamped version (see [Version and resources](#version-and-resources-helperrc)); `0.0.0` for an unstamped local build. |
+| `device` | DirectShow friendly name of the camera the helper attached to. |
+| `preview_frames` | Running count of preview frames delivered since this capture session started. |
+| `still_seq` | Running count of accepted (non-debounced) button presses since this session started. |
+| `still_available` | Whether `/still` currently has an image to serve — `false` until the first button press of this session. |
+| `port` | The TCP port the helper is actually listening on. |
+| `uptime_s` | Seconds since this capture session started (the last Start, including the automatic one at launch). |
+
+**A refused/failed connection to `/health` — not a particular status code from it — means the helper is stopped or not running at all.** That is the "not connected" signal for a web app to show; treat it as distinct from a `204` on `/still`, which just means nothing has been captured yet.
+
+Response includes `Access-Control-Allow-Origin: *`.
+
+### CORS preflight (`OPTIONS`)
+
+`OPTIONS` on `/`, `/preview`, `/still`, or `/health` returns `204 No Content` with `Access-Control-Allow-Origin: *`, `Access-Control-Allow-Methods: GET, OPTIONS`, `Access-Control-Allow-Headers: *`, and `Access-Control-Max-Age: 600`, so a browser's CORS preflight (triggered by a non-simple request, e.g. a custom header) never fails. Every endpoint here is otherwise `GET`-only.
 
 ### `GET /`
 

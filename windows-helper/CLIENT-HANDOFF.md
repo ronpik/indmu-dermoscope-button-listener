@@ -66,7 +66,7 @@ No admin rights, no driver install, no firewall prompt (loopback-only bind to `1
 
 ---
 
-## What the web-app team needs to add (two touches)
+## What the web-app team needs to add (three touches)
 
 ### 1. Preview source
 
@@ -83,13 +83,35 @@ document.addEventListener('keydown', async e => {
   if (e.key !== 'F9' && e.code !== 'F9') return;
   e.preventDefault();
   const resp = await fetch('http://localhost:8080/still', { cache: 'no-store' });
+  if (resp.status === 204) return;   // nothing captured yet this session -- not an error
   if (!resp.ok) return;
   const blob = await resp.blob();
   // render or upload the blob -- it's a ~1600x1200 JPEG
 });
 ```
 
-Both endpoints send `Access-Control-Allow-Origin: *`, so cross-origin from any web app on any origin is allowed.
+`/still` returns **`204 No Content`** (not `404`) before the first button press of a session — that's a normal "nothing captured yet" state, so don't treat it as "helper not connected".
+
+### 3. Connectivity check: `GET /health`
+
+Poll `http://localhost:8080/health` to know whether the helper is running — **that's** the "is the helper connected" signal, not `/still`. It responds `200 application/json` (`{"status":"running", ...}`) whenever the helper's HTTP server is up. **A refused/failed connection — not a particular response from it — means the helper is stopped or not running at all:**
+
+```js
+async function helperIsUp() {
+  try {
+    const resp = await fetch('http://localhost:8080/health', { cache: 'no-store' });
+    return resp.ok;
+  } catch {
+    return false;   // connection refused: helper is stopped or not running
+  }
+}
+```
+
+See [`README.md`](README.md#get-health) for the full response shape (version, device name, frame counters, `still_available`, `uptime_s`).
+
+---
+
+All three endpoints send `Access-Control-Allow-Origin: *`, so cross-origin from any web app on any origin is allowed.
 
 ---
 
