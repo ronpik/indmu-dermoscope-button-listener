@@ -181,9 +181,17 @@ static std::atomic<int> g_captureWidth{0};
 static std::atomic<int> g_captureHeight{0};
 static std::atomic<long long> g_captureFrameInterval100ns{0};
 
-// Every BufferCB early-return (bogus buffer, FRAME_SKIP drop, try_lock miss,
-// future publish-time filters) bumps this. preview_frames + rejected across a
-// window ~= driver input fps.
+// BufferCB frame accounting, split by reason so the numbers stay diagnostic:
+// lumping deliberate decimation in with genuine bad frames would bury a
+// handful of real rejections under ~half the input stream.
+//   in            -- every buffer the driver hands us
+//   skipped       -- dropped by FRAME_SKIP decimation (expected, not a fault)
+//   dropped_busy  -- try_lock miss; a publisher/consumer contention signal
+//   rejected      -- malformed buffer, and publish-time quality filters
+// in == frames + skipped + dropped_busy + rejected.
+static std::atomic<long long> g_previewFramesIn{0};
+static std::atomic<long long> g_previewFramesSkipped{0};
+static std::atomic<long long> g_previewFramesDroppedBusy{0};
 static std::atomic<long long> g_previewFramesRejected{0};
 
 // Number of live /preview streaming loops. Maintained by an RAII guard around
@@ -222,6 +230,11 @@ public:
     void reset() { std::lock_guard<std::mutex> lk(mu_); ts_ms_.clear(); }
 };
 static PreviewFpsMeter g_previewFps;
+// Measured at the top of BufferCB, before any filtering. The driver's
+// advertised AvgTimePerFrame is not what this camera actually delivers
+// (it claims 15 fps at 1600x1200 and delivers ~6.9), so this is the
+// yardstick for any capture-mode change -- never the advertised figure.
+static PreviewFpsMeter g_previewInputFps;
 
 enum class HelperState { Stopped, Running, DeviceNotFound, CameraBusy, Error };
 static std::atomic<HelperState> g_state{HelperState::Stopped};
@@ -306,12 +319,14 @@ public:
     ULONG STDMETHODCALLTYPE Release() override { return InterlockedDecrement(&ref); }
     HRESULT STDMETHODCALLTYPE SampleCB(double, IMediaSample*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE BufferCB(double, BYTE *pBuf, long len) override {
+        g_previewFramesIn.fetch_add(1);
+        g_previewInputFps.note();
         if (len <= 0 || !pBuf) { g_previewFramesRejected.fetch_add(1); return S_OK; }
         if ((InterlockedIncrement(&frame_count) % FRAME_SKIP) != 0) {
-            g_previewFramesRejected.fetch_add(1); return S_OK;
+            g_previewFramesSkipped.fetch_add(1); return S_OK;
         }
         std::unique_lock<std::mutex> lk(g_previewMutex, std::try_to_lock);
-        if (!lk.owns_lock()) { g_previewFramesRejected.fetch_add(1); return S_OK; }
+        if (!lk.owns_lock()) { g_previewFramesDroppedBusy.fetch_add(1); return S_OK; }
         if (g_latestPreview.size() != (size_t)len) g_latestPreview.resize((size_t)len);
         memcpy(g_latestPreview.data(), pBuf, (size_t)len);
         g_previewSeq.fetch_add(1);
@@ -779,11 +794,13 @@ static void handle_client(SOCKET sock) {
         int capW = g_captureWidth.load();
         int capH = g_captureHeight.load();
         long long capInterval = g_captureFrameInterval100ns.load();
-        double capInputFps = (capInterval > 0) ? (1.0e7 / (double)capInterval) : 0.0;
+        double capAdvertisedFps = (capInterval > 0) ? (1.0e7 / (double)capInterval) : 0.0;
         double previewFps = g_previewFps.rate_hz();
-        char fpsBuf[32], inFpsBuf[32];
-        snprintf(fpsBuf,   sizeof(fpsBuf),   "%.2f", previewFps);
-        snprintf(inFpsBuf, sizeof(inFpsBuf), "%.2f", capInputFps);
+        double inputFps = g_previewInputFps.rate_hz();
+        char fpsBuf[32], advFpsBuf[32], inFpsBuf[32];
+        snprintf(fpsBuf,    sizeof(fpsBuf),    "%.2f", previewFps);
+        snprintf(advFpsBuf, sizeof(advFpsBuf), "%.2f", capAdvertisedFps);
+        snprintf(inFpsBuf,  sizeof(inFpsBuf),  "%.2f", inputFps);
 
         // status is always "running": the HTTP server -- and so /health --
         // only exists while capture is running (see the top of this file).
@@ -793,10 +810,16 @@ static void handle_client(SOCKET sock) {
         body += ",\"capture_width\":" + std::to_string(capW);
         body += ",\"capture_height\":" + std::to_string(capH);
         body += ",\"capture_frame_interval_100ns\":" + std::to_string(capInterval);
-        body += ",\"capture_input_fps\":";  body += inFpsBuf;
+        // Advertised by the driver; this camera does NOT deliver it. Compare
+        // against preview_input_fps, which is measured.
+        body += ",\"capture_advertised_fps\":"; body += advFpsBuf;
+        body += ",\"preview_frames_in\":" + std::to_string(g_previewFramesIn.load());
+        body += ",\"preview_input_fps\":";  body += inFpsBuf;
         body += ",\"preview_frames\":" + std::to_string(g_previewSeq.load());
-        body += ",\"preview_frames_rejected\":" + std::to_string(g_previewFramesRejected.load());
         body += ",\"preview_fps\":";        body += fpsBuf;
+        body += ",\"preview_frames_skipped\":" + std::to_string(g_previewFramesSkipped.load());
+        body += ",\"preview_frames_dropped_busy\":" + std::to_string(g_previewFramesDroppedBusy.load());
+        body += ",\"preview_frames_rejected\":" + std::to_string(g_previewFramesRejected.load());
         body += ",\"preview_clients\":" + std::to_string(g_previewClients.load());
         body += ",\"still_seq\":" + std::to_string(g_stillSeq.load());
         body += std::string(",\"still_available\":") + (stillAvailable ? "true" : "false");
@@ -1103,8 +1126,12 @@ static void stop_capture() {
         g_deviceName.clear();
     }
     g_previewSeq.store(0);
+    g_previewFramesIn.store(0);
+    g_previewFramesSkipped.store(0);
+    g_previewFramesDroppedBusy.store(0);
     g_previewFramesRejected.store(0);
     g_previewFps.reset();
+    g_previewInputFps.reset();
     g_captureWidth.store(0);
     g_captureHeight.store(0);
     g_captureFrameInterval100ns.store(0);
