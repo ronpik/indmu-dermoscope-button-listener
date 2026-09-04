@@ -542,6 +542,40 @@ static void configure_format(IBaseFilter *pSrc, ICaptureGraphBuilder2 *pBuilder,
     pCfg->Release();
 }
 
+// SCAFFOLDING -- NOT FOR RELEASE. Cross-session coordination channel for the
+// preview-perf experiments: the helper is the only surface both the Windows
+// (helper) and Mac (web app) sides can see, and the Mac polls /health every
+// 2 s. Reading the note at request time rather than at startup means a message
+// can be changed by editing the file, with no rebuild and no stream drop.
+// Drop this commit before opening the PR.
+static std::string read_note_file() {
+    wchar_t dir[MAX_PATH] = {0};
+    DWORD n = GetModuleFileNameW(NULL, dir, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return std::string();
+    wchar_t *slash = wcsrchr(dir, L'\\');
+    if (!slash) return std::string();
+    slash[1] = 0;
+    if (wcslen(dir) + 20 >= MAX_PATH) return std::string();
+
+    wchar_t path[MAX_PATH];
+    wcscpy(path, dir);
+    wcscat(path, L"helper-note.txt");
+    FILE *fp = _wfopen(path, L"rb");
+    if (!fp) return std::string();
+
+    // Cap the body: /health is polled every 2 s and must stay cheap.
+    static const size_t NOTE_MAX = 8192;
+    std::string out;
+    char buf[1024];
+    size_t got;
+    while (out.size() < NOTE_MAX && (got = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        out.append(buf, got);
+    }
+    fclose(fp);
+    if (out.size() > NOTE_MAX) out.resize(NOTE_MAX);
+    return out;
+}
+
 // ---- HTTP server ----
 static const char INDEX_HTML[] =
 "<!DOCTYPE html>\n"
@@ -824,7 +858,8 @@ static void handle_client(SOCKET sock) {
         body += ",\"still_seq\":" + std::to_string(g_stillSeq.load());
         body += std::string(",\"still_available\":") + (stillAvailable ? "true" : "false");
         body += ",\"port\":" + std::to_string(g_port);
-        body += ",\"uptime_s\":" + std::to_string(uptimeS) + "}";
+        body += ",\"uptime_s\":" + std::to_string(uptimeS);
+        body += ",\"note\":\"" + json_escape(read_note_file()) + "\"}";
 
         char hdr[256];
         int hlen = snprintf(hdr, sizeof(hdr),
