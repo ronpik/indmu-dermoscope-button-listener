@@ -119,6 +119,17 @@ static int g_port = 8080;
 static std::atomic<int> g_configuredWidth{1024};
 static std::atomic<int> g_configuredHeight{768};
 
+// Still-pin resolution, configurable for the same reason plus one more: raising
+// it is what makes /still a real device capture, but the device's firmware
+// cooldown grows with it and at some resolution the button may stop being
+// usable. Being able to walk it down from a config file means that boundary can
+// be found without a rebuild per step.
+static std::atomic<int> g_stillConfWidth{1600};
+static std::atomic<int> g_stillConfHeight{1200};
+// What the Still pin actually negotiated, which can differ from the above.
+static std::atomic<int> g_stillPinWidth{0};
+static std::atomic<int> g_stillPinHeight{0};
+
 // Identifies this run of the helper. An app holding a still_seq across a helper
 // restart would otherwise long-poll ?after=<old seq> forever against a counter
 // that has reset to 0; a changed run_id tells it to drop the stored value.
@@ -152,12 +163,19 @@ static void load_preview_config() {
         const char *s = line;
         while (*s == ' ' || *s == '\t') ++s;
         if (*s == '#' || *s == ';') continue;
-        if (strncmp(s, "preview_resolution", 18) != 0) continue;
+        bool isPreview = strncmp(s, "preview_resolution", 18) == 0;
+        bool isStill   = strncmp(s, "still_resolution", 16) == 0;
+        if (!isPreview && !isStill) continue;
         const char *eq = strchr(s, '=');
         int w = 0, h = 0;
         if (eq && sscanf(eq + 1, " %d %*[xX] %d", &w, &h) == 2 && w > 0 && h > 0) {
-            g_configuredWidth.store(w);
-            g_configuredHeight.store(h);
+            if (isPreview) {
+                g_configuredWidth.store(w);
+                g_configuredHeight.store(h);
+            } else {
+                g_stillConfWidth.store(w);
+                g_stillConfHeight.store(h);
+            }
         }
     }
     fclose(fp);
@@ -681,6 +699,9 @@ static void configure_format(IBaseFilter *pSrc, ICaptureGraphBuilder2 *pBuilder,
             g_captureWidth.store(bestW);
             g_captureHeight.store(bestH);
             g_captureFrameInterval100ns.store(avgTimePerFrame);
+        } else if (IsEqualGUID(*pinCategory, PIN_CATEGORY_STILL)) {
+            g_stillPinWidth.store(bestW);
+            g_stillPinHeight.store(bestH);
         }
         free_mt(bestMT);
     }
@@ -1150,6 +1171,8 @@ static void handle_client(SOCKET sock) {
         // camera does not offer, which is otherwise silent.
         body += ",\"configured_width\":" + std::to_string(g_configuredWidth.load());
         body += ",\"configured_height\":" + std::to_string(g_configuredHeight.load());
+        body += ",\"still_pin_width\":" + std::to_string(g_stillPinWidth.load());
+        body += ",\"still_pin_height\":" + std::to_string(g_stillPinHeight.load());
         body += ",\"still_seq\":" + std::to_string(g_stillSeq.load());
         body += std::string(",\"still_available\":") + (stillAvailable ? "true" : "false");
         // Read from the still's own SOF header, so this reports what the device
@@ -1532,7 +1555,8 @@ static HelperState start_capture() {
     // device's post-capture firmware cooldown short enough for multi-click
     // detection; multi-click was dropped in 9e0fef4, so that constraint is gone
     // and a slower cooldown buys real device stills instead of preview frames.
-    configure_format(g_cap.pSrc, g_cap.pBuilder, &PIN_CATEGORY_STILL,   1600, 1200);
+    configure_format(g_cap.pSrc, g_cap.pBuilder, &PIN_CATEGORY_STILL,
+                     g_stillConfWidth.load(), g_stillConfHeight.load());
 
     // Capture pin -> Preview SampleGrabber -> NullRenderer
     hr = CoCreateInstance(CLSID_SampleGrabber_local, NULL, CLSCTX_INPROC_SERVER,
@@ -2090,6 +2114,13 @@ int main(int argc, char **argv) {
                 if (sscanf(argv[i] + 10, "%d %*[xX] %d", &w, &h) == 2 && w > 0 && h > 0) {
                     g_configuredWidth.store(w);
                     g_configuredHeight.store(h);
+                }
+            }
+            if (strncmp(argv[i], "--still=", 8) == 0) {
+                int w = 0, h = 0;
+                if (sscanf(argv[i] + 8, "%d %*[xX] %d", &w, &h) == 2 && w > 0 && h > 0) {
+                    g_stillConfWidth.store(w);
+                    g_stillConfHeight.store(h);
                 }
             }
             continue;
