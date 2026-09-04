@@ -508,6 +508,8 @@ static void configure_format(IBaseFilter *pSrc, ICaptureGraphBuilder2 *pBuilder,
                 VIDEOINFOHEADER *vih = (VIDEOINFOHEADER*)mt->pbFormat;
                 int w = vih->bmiHeader.biWidth;
                 int h = vih->bmiHeader.biHeight;
+                log_ts("  candidate MJPG %dx%d (AvgTimePerFrame=%lld 100ns)",
+                       w, h, (long long)vih->AvgTimePerFrame);
                 bool better = (!bestMT) ||
                     (w >= wantW && h >= wantH && (bestW < wantW || bestH < wantH || w*h < bestW*bestH)) ||
                     (bestW < wantW && bestH < wantH && w*h > bestW*bestH);
@@ -1211,7 +1213,7 @@ static HelperState start_capture() {
 
     // Capture pin at 1600x1200 MJPG: live preview + source of /still snapshot.
     // Still pin at 320x240 MJPG: hardware-button trigger only; bytes discarded.
-    configure_format(g_cap.pSrc, g_cap.pBuilder, &PIN_CATEGORY_CAPTURE, 9999, 9999);
+    configure_format(g_cap.pSrc, g_cap.pBuilder, &PIN_CATEGORY_CAPTURE, 1280, 960);
     configure_format(g_cap.pSrc, g_cap.pBuilder, &PIN_CATEGORY_STILL,    320,  240);
 
     // Capture pin -> Preview SampleGrabber -> NullRenderer
