@@ -306,7 +306,7 @@ class PreviewCB : public ISampleGrabberCB_local {
 public:
     LONG ref = 1;
     LONG frame_count = 0;
-    static const LONG FRAME_SKIP = 2;
+    static const LONG FRAME_SKIP = 1;
     virtual ~PreviewCB() {}   // we delete these by concrete type in stop_capture()
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override {
         if (!ppv) return E_POINTER;
