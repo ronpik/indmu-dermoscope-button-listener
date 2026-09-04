@@ -265,6 +265,14 @@ static std::atomic<long long> g_lastStillMs{0};
 static std::atomic<long long> g_lastPreviewMs{0};
 static std::atomic<long long> g_maxGapSinceStillMs{0};
 
+// A single max-gap number answers "how long was the freeze" but not "how long
+// until it is smooth again", and a press requires a human, so one press has to
+// yield both. After a still, the next GAP_TRACE_FRAMES preview frames log their
+// own inter-frame gap: the first is the stall, and the point where the gaps
+// settle back to the nominal ~147 ms is the recovery time.
+static const int GAP_TRACE_FRAMES = 40;
+static std::atomic<int> g_gapTraceRemaining{0};
+
 // Reads width/height out of a JPEG's SOF header. Walks the marker chain rather
 // than searching for FF C0, because those two bytes occur often inside entropy-
 // coded data and a naive search finds garbage. Returns false on anything it does
@@ -465,6 +473,13 @@ public:
                 long long best = g_maxGapSinceStillMs.load();
                 while (gap > best &&
                        !g_maxGapSinceStillMs.compare_exchange_weak(best, gap)) {}
+                int left = g_gapTraceRemaining.load();
+                while (left > 0 &&
+                       !g_gapTraceRemaining.compare_exchange_weak(left, left - 1)) {}
+                if (left > 0) {
+                    log_ts("  post-still preview frame %d: gap %lld ms, t+%lld ms",
+                           GAP_TRACE_FRAMES - left + 1, gap, now - g_lastStillMs.load());
+                }
             }
         }
         if (len <= 0 || !pBuf) { g_previewFramesRejected.fetch_add(1); return S_OK; }
@@ -532,6 +547,7 @@ public:
         // this capture's cooldown and not the previous one's.
         g_lastStillMs.store(steady_now_ms());
         g_maxGapSinceStillMs.store(0);
+        g_gapTraceRemaining.store(GAP_TRACE_FRAMES);
         g_stillCV.notify_all();
         if (haveDims) {
             log_ts("  still trigger -> /still %ld bytes %dx%d, sending F9", len, sw, sh);
