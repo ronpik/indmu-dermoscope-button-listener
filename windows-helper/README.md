@@ -34,8 +34,9 @@ This is the **working Windows path** produced by the investigation documented in
                                             (hardware button press)
 ```
 
-- **Live preview** streams at the device's highest MJPEG resolution (1600×1200) from the UVC Capture pin.
-- **Still capture** on button press: we snapshot the most recent preview frame into a dedicated buffer — that's what `GET /still` serves. Captures match the preview quality (1600×1200). The Still-pin stream is used *only* as the hardware trigger; its own bytes are discarded.
+- **Live preview** streams from the UVC Capture pin at **1024×768** by default, [configurable](#configuration-file-helper-configtxt) up to the device's top MJPEG mode of 1600×1200. The default is tuned for Wi-Fi, where frame *size* rather than frame rate sets what a remote browser can actually display.
+- **Still capture** on button press: `GET /still` serves the **device's own still image** from the UVC Still pin at **1600×1200**, independent of the preview resolution. A capture freezes the preview for about 2 s — see "Known issues".
+- **Software capture** without a button press: `GET /snapshot` returns the latest preview frame, for an on-screen Capture button.
 - **Keystroke** via `SendInput` to the focused window: one **F9** per button press. The web app treats every F9 as "capture". Multi-click gestures (clear / undo / etc.) are not reliable on this hardware — see "Known issues" below and [`../docs/NEXT-SESSION.md`](../docs/NEXT-SESSION.md) for the full post-mortem. Put those gestures in the web app's own UI.
 
 ---
@@ -311,16 +312,58 @@ assuming a build or install bug. See the Defender note in
 ## Runtime usage
 
 ```
-helper.exe [--console] [port] [debounce_ms]
+helper.exe [--console] [--preview=WxH] [--still=WxH] [port] [debounce_ms]
 ```
 
 | Arg | Default | What it does |
 |---|---|---|
 | `--console` | off | Keeps the console window open and logs to **stderr**, as in previous versions. Without it the console is detached and the log goes to `helper.log` next to the exe. The tray icon appears either way. |
-| `port` | `8080` | TCP port for the local HTTP server (bound to `127.0.0.1`). |
+| `--preview=WxH` | `1024x768` | Capture-pin (live preview) resolution. Overrides `preview_resolution` in the config file. |
+| `--still=WxH` | `1600x1200` | Still-pin resolution — the image `GET /still` serves. Overrides `still_resolution` in the config file. |
+| `port` | `8080` | TCP port for the HTTP server. Bound to all interfaces, so other machines on the LAN can reach it. |
 | `debounce_ms` | `300` | Suppresses still frames arriving within this window of the previous accepted one. Defense-in-depth only — the device's firmware cooldown between stills is much longer than this anyway. |
 
 Flags don't consume positional slots: `helper.exe --console 9090` runs on port 9090.
+
+### Configuration file (`helper-config.txt`)
+
+Resolutions are settings, not constants. Put `helper-config.txt` **next to `helper.exe`** (the same folder as `helper.log`):
+
+```
+# Dermoscope helper settings
+preview_resolution = 1024x768
+still_resolution   = 1600x1200
+```
+
+One `key = value` per line; `#` and `;` start a comment. **A missing file, an unknown key, or an unparseable value all leave the defaults in place** — a machine that has never heard of this file keeps working.
+
+| Key | Default | What it sets |
+|---|---|---|
+| `preview_resolution` | `1024x768` | Capture-pin resolution: the live `/preview` stream and `/snapshot`. |
+| `still_resolution` | `1600x1200` | Still-pin resolution: the image `/still` serves on a button press. |
+
+Precedence is **CLI flag > config file > built-in default**.
+
+Both are read **once at startup**, because changing either rebuilds the DirectShow graph. Edit the file and restart the helper — no rebuild. (This is unlike the log, which is written continuously.)
+
+**Why the preview default is 1024×768.** Over Wi-Fi the link, not the helper, is the bottleneck, and client frame rate is set by bytes-per-frame rather than by how fast frames are published. Measured on an 802.11 link at ~57.8 Mbps, with the publisher offering 6.8 fps at every resolution:
+
+| Preview mode | Frame size | Client fps |
+|---|---|---|
+| 1600×1200 | ~811 KB | 2.4 |
+| 1280×960 | ~453 KB | 4.1 |
+| **1024×768** | **~290 KB** | **6.1** |
+
+On a wired or otherwise fast link that constraint disappears, and `preview_resolution = 1600x1200` is a one-line change. Note this affects the **preview only** — `/still` is unaffected and keeps serving full-resolution device stills.
+
+**Check what actually happened.** The camera advertises a fixed list of modes, and `configure_format` silently falls back to the nearest one it offers rather than failing. `GET /health` therefore reports the requested and the negotiated mode side by side, so a typo is visible instead of silent:
+
+```
+preview_resolution = 999x999   ->   "configured_width": 999,  "capture_width": 1280
+                                     "configured_height": 999, "capture_height": 1024
+```
+
+If `configured_*` and `capture_*` disagree, the mode you asked for does not exist on that camera. There is deliberately no hardcoded list of valid modes to check against — it would rot against a different camera. The Still pin's list is the capture list **minus 1024×768**, so `still_resolution = 1024x768` will quietly land on a neighbouring mode; `still_pin_width`/`still_pin_height` will show it.
 
 ### Log output
 
@@ -343,7 +386,7 @@ All endpoints are under `http://localhost:<port>/`, and also reachable at `http:
 
 ### `GET /preview`
 
-Multipart MJPEG stream (`multipart/x-mixed-replace; boundary=frame`) at **1600×1200** (the HT-B30S's top MJPEG mode), typically ~15 fps. Intended to be consumed as the `src` of an `<img>` tag:
+Multipart MJPEG stream (`multipart/x-mixed-replace; boundary=frame`) at the [configured preview resolution](#configuration-file-helper-configtxt) — **1024×768** by default. The HT-B30S delivers **~6.8 fps at every resolution**; the 15 fps its driver advertises is not achievable at any mode, so don't design around it. Intended to be consumed as the `src` of an `<img>` tag:
 
 ```html
 <img src="http://localhost:8080/preview" alt="dermoscope preview">
@@ -353,25 +396,51 @@ Browser support is universal. You can also read the same URL with `fetch()` and 
 
 Response headers include `Access-Control-Allow-Origin: *` so the endpoint can be consumed from any origin.
 
-Query strings on any endpoint are accepted and ignored (stripped before routing), so the common cache-busting pattern `/preview?t=${Date.now()}` works as expected — see "Recovering from a Stop/Start cycle" below for why you'd want that.
+Query strings are stripped before routing, so the common cache-busting pattern `/preview?t=${Date.now()}` works as expected — see "Recovering from a Stop/Start cycle" below for why you'd want that. They are *ignored* everywhere except `/still`, which reads `?after=<seq>` out of the query string to long-poll (see below); a cache-buster there is harmless as long as you keep `after=` intact.
 
 ### `GET /still`
 
-Returns the **most recent full-resolution JPEG** snapshot — a copy of the preview frame that was live at the moment the user pressed the hardware button. Content type is `image/jpeg`. Resolution matches the preview (1600×1200 unless you've edited the source). If no button has been pressed yet this session, returns **`204 No Content`** (empty body) — **not** `404`. (Prior to the `/health` endpoint below, this returned `404`; that was a breaking change for any client keying off `404` specifically — see `still_available` on `/health` if you need to check without triggering a fetch of nothing.)
+Returns the **device's own still image** from the last hardware button press — the bytes the camera's Still pin produced, at `still_resolution` (1600×1200 by default). Content type is `image/jpeg`. If no button has been pressed yet this session, returns **`204 No Content`** (empty body) — **not** `404`. (Prior to the `/health` endpoint below, this returned `404`; that was a breaking change for any client keying off `404` specifically — see `still_available` on `/health` if you need to check without triggering a fetch of nothing.)
 
-Implementation note: this is *not* a still-pin frame — DirectShow's Still pin on this device is used only as the click trigger and kept at 320×240 (its bytes are discarded). For capture quality we snapshot the high-res preview-pin frame at trigger time and serve that.
+These are real device stills, not a frozen preview frame. That distinction is the whole point: the preview pin is deliberately run at a lower resolution for streaming smoothness, while `/still` stays at full resolution for diagnostic quality. `still_width`/`still_height` on `/health` are parsed from the returned JPEG's own SOF header, so they report what the device actually produced rather than what the pin was asked for.
+
+Every response — including the `204` — carries the sequence number of the still it represents:
+
+```
+X-Still-Seq: 5
+Access-Control-Expose-Headers: X-Still-Seq
+```
+
+The `Expose-Headers` line matters: **without it a cross-origin `fetch()` cannot read `X-Still-Seq` at all**, and `resp.headers.get()` returns `null` with no error to explain why.
+
+#### `GET /still?after=<seq>` — long-poll
+
+Blocks until a still **newer than `<seq>`** arrives, then returns it as above. If none arrives within **8 seconds**, returns `204`. The wait is a real condition-variable wait, not a polling loop, and it is checked in 250 ms slices so an aborted request (a cancelled retake) releases its thread promptly rather than holding it for the full 8 s. `/health` and `/snapshot` stay fully responsive while a long-poll is blocked.
+
+In practice this returns immediately, because the ordering is guaranteed by construction: the helper stores the bytes, bumps `still_seq`, and only **then** synthesises the F9 keystroke. So by the time your F9 handler runs, the image is already there. A long-poll that actually blocks means the keystroke was lost (the browser wasn't focused) — the capture still happened, and this is how you collect it.
 
 ```js
-// After receiving F9 (button-click-driven):
-const resp = await fetch('http://localhost:8080/still', { cache: 'no-store' });
-if (resp.status === 204) { /* nothing captured yet this session */ }
-else if (resp.ok) {
-  const blob = await resp.blob();
+// seq is what /health last reported, or 0. Reset it whenever run_id changes.
+const resp = await fetch(`http://localhost:8080/still?after=${seq}`, { cache: 'no-store' });
+if (resp.status === 204) {
+  // No new still within 8 s — the press produced nothing (see the note on
+  // swallowed clicks under "Known issues"), or there was no press.
+} else if (resp.ok) {
+  seq = Number(resp.headers.get('X-Still-Seq'));
   const img = new Image();
-  img.src = URL.createObjectURL(blob);
-  // img is 1600x1200 JPEG by default
+  img.src = URL.createObjectURL(await resp.blob());
 }
 ```
+
+**F9 is sent only when new bytes were actually stored.** If the device delivers an empty or malformed buffer, `/still` keeps the previous image and no keystroke is emitted — so a failed capture presents as "the button did nothing" rather than silently re-saving the previous lesion. Do not assume every physical press produces an F9.
+
+Response includes `Access-Control-Allow-Origin: *`.
+
+### `GET /snapshot`
+
+Returns the **latest preview frame** as `image/jpeg`, at the capture-pin resolution (1024×768 by default, ~274 KB). Never blocks and needs no button press — this is the endpoint for an on-screen "Capture" button, as opposed to `/still`'s hardware button. Returns `204 No Content` only if no preview frame has been received yet.
+
+Because it serves the preview pin, it is unaffected by the Still pin's cooldown, and it costs the device nothing extra — it is a copy of a frame that was already captured for the stream.
 
 Response includes `Access-Control-Allow-Origin: *`.
 
@@ -384,9 +453,23 @@ Returns `200 application/json` whenever the helper's HTTP server is up — the r
   "status": "running",
   "version": "1.2.3",
   "device": "USB Camera",
+  "run_id": 1788557650209,
+  "configured_width": 1024,
+  "configured_height": 768,
+  "capture_width": 1024,
+  "capture_height": 768,
+  "still_pin_width": 1600,
+  "still_pin_height": 1200,
   "preview_frames": 4821,
+  "preview_fps": 6.82,
+  "preview_input_fps": 6.82,
+  "preview_clients": 1,
   "still_seq": 3,
   "still_available": true,
+  "still_width": 1600,
+  "still_height": 1200,
+  "still_last_ms_ago": 20343,
+  "preview_max_gap_ms_since_still": 2049,
   "port": 8080,
   "uptime_s": 57
 }
@@ -397,9 +480,21 @@ Returns `200 application/json` whenever the helper's HTTP server is up — the r
 | `status` | Always `"running"` — the HTTP server (and so `/health`) exists only while capture is running; when the helper is stopped or not running, the connection is refused instead of returning a different `status` value. |
 | `version` | The stamped version (see [Version and resources](#version-and-resources-helperrc)); `0.0.0` for an unstamped local build. |
 | `device` | DirectShow friendly name of the camera the helper attached to. |
-| `preview_frames` | Running count of preview frames delivered since this capture session started. |
-| `still_seq` | Running count of accepted (non-debounced) button presses since this session started. |
+| `run_id` | Identifies this run of the helper (ms epoch at startup). **A client holding a `still_seq` across a helper restart must drop it when `run_id` changes** — the counter resets to 0, so a stale `?after=` would otherwise wait forever. |
+| `configured_width` / `_height` | The preview resolution that was **requested** (config file or `--preview`). |
+| `capture_width` / `_height` | The capture-pin mode actually **negotiated**. Differs from `configured_*` when the camera doesn't offer that mode — see [Configuration file](#configuration-file-helper-configtxt). |
+| `still_pin_width` / `_height` | The Still-pin mode actually negotiated, for the same reason. |
+| `preview_frames` | Running count of preview frames **published** since this capture session started. |
+| `preview_fps` | Measured rate at which frames are being published. |
+| `preview_input_fps` | Measured rate at which the camera is **delivering** frames. Compare with `preview_fps` to see whether the helper is dropping any. |
+| `preview_frames_in`, `_skipped`, `_dropped_busy`, `_rejected` | Frame accounting: received, deliberately skipped, dropped because the buffer was locked, and rejected as malformed. |
+| `preview_clients` | Number of `/preview` streams currently attached. |
+| `capture_frame_interval_100ns`, `capture_advertised_fps` | What the driver *claims* the capture pin runs at. **Advertised fps is not reliable on this device** (it reports 15 fps at every mode while delivering ~6.8); trust `preview_input_fps` instead. |
+| `still_seq` | Running count of accepted (non-debounced) button presses since this session started. Increments **before** the F9 keystroke is sent. |
 | `still_available` | Whether `/still` currently has an image to serve — `false` until the first button press of this session. |
+| `still_width` / `_height` | Dimensions parsed from the stored still's **own JPEG SOF header**, so this is what the device actually produced rather than what the pin was asked for. `0` when nothing has been captured yet. |
+| `still_last_ms_ago` | Milliseconds since the last still was stored; `-1` if there hasn't been one. |
+| `preview_max_gap_ms_since_still` | Largest gap between preview frames since the last still, reset on every still. The device freezes the preview for roughly **2 s** while it produces a still, so shortly after a press this reads ~2000; in steady state it sits near the nominal frame interval (~147 ms at 6.8 fps). |
 | `port` | The TCP port the helper is actually listening on. |
 | `uptime_s` | Seconds since this capture session started (the last Start, including the automatic one at launch). |
 
@@ -409,7 +504,7 @@ Response includes `Access-Control-Allow-Origin: *`.
 
 ### CORS preflight (`OPTIONS`)
 
-`OPTIONS` on `/`, `/preview`, `/still`, or `/health` returns `204 No Content` with `Access-Control-Allow-Origin: *`, `Access-Control-Allow-Methods: GET, OPTIONS`, `Access-Control-Allow-Headers: *`, and `Access-Control-Max-Age: 600`, so a browser's CORS preflight (triggered by a non-simple request, e.g. a custom header) never fails. Every endpoint here is otherwise `GET`-only.
+`OPTIONS` on `/`, `/index.html`, `/preview`, `/still`, `/snapshot`, or `/health` returns `204 No Content` with `Access-Control-Allow-Origin: *`, `Access-Control-Allow-Methods: GET, OPTIONS`, `Access-Control-Allow-Headers: *`, and `Access-Control-Max-Age: 600`, so a browser's CORS preflight (triggered by a non-simple request, e.g. a custom header) never fails. Every endpoint here is otherwise `GET`-only.
 
 ### `GET /`
 
@@ -438,7 +533,7 @@ Minimum integration — add two things to the web app that currently uses `getUs
    ```html
    <img id="preview" src="http://localhost:8080/preview">
    ```
-   Native resolution is 1600×1200; apply CSS for display size. If the preview looks laggy on a slow USB bus, you can drop the preview resolution by editing `configure_format(..., &PIN_CATEGORY_CAPTURE, 9999, 9999)` in `helper.cpp` — e.g. pass `1024, 768` — and rebuild.
+   Default resolution is 1024×768; apply CSS for display size. If the preview looks laggy — most often over Wi-Fi, where bytes per frame rather than frame rate is the limit — change `preview_resolution` in [`helper-config.txt`](#configuration-file-helper-configtxt) and restart. No rebuild, and it does not affect `/still`.
 
 2. **Listen for F9 keydown and fetch `/still`.** One F9 per button press.
    ```js
@@ -510,9 +605,30 @@ Only one app can stream from the dermoscope at a time on Windows. If anything el
 
 `SendInput` only reaches the foreground window of the current interactive user session. Running the helper as a Windows service would break this. Auto-start is a Startup-folder shortcut under the interactive user, not a service — which is exactly what the [installer](#install)'s "Start Dermoscope Helper when I sign in" option sets up. Running the bare exe manually (no installer) registers nothing; you'd have to make your own Startup-folder shortcut if you want the same effect.
 
-### Preview and capture share one buffer
+### A capture freezes the preview for about 2 seconds
 
-The captured image (`/still`) is a snapshot of the Preview pin at the moment the user pressed the button. If you lower the Capture-pin resolution, captured images drop in resolution too. Historically this trade-off existed to keep the Still pin tiny for multi-click detection; now that multi-click is out of scope, keeping it this way is just the simplest design. If you ever want to diverge preview and capture resolution on a future device, the cleanest switch is reading Still-pin bytes directly in `StillCB::BufferCB`.
+While the device produces a still, its firmware stops delivering frames on the capture pin, so the live preview freezes. This is the device's behaviour, not a helper stall, and it is the price of real full-resolution device stills.
+
+Measured on the HT-B30S with the Still pin at 1600×1200, across four clean presses:
+
+| | |
+|---|---|
+| Freeze after a press | **1904 ms** (1903 / 1905 / 1904 / 1903 — a 2 ms spread) |
+| Recovery once it ends | **immediate** — the next frame is already at the nominal interval |
+
+There is no gradual ramp: frame 1 after the still shows the ~2 s gap, frame 2 is back to ~144 ms (nominal is 147 ms at 6.8 fps), so a "recovering" UI state isn't warranted. `preview_max_gap_ms_since_still` on `/health` reports this per capture.
+
+The image itself is ready at the **start** of that window — the bytes are stored and `still_seq` is bumped before the F9 keystroke is sent — so an app that renders the captured still immediately hides the freeze entirely.
+
+Note this affects `/snapshot` too, since it serves preview frames: for ~2 s after a press it returns the frame from just before the capture.
+
+### A press during the cooldown is silently swallowed
+
+If the button is pressed while the device is still in that ~2 s window, the firmware discards it: `StillCB::BufferCB` is never called, so there is **no still, no `still_seq` increment and no F9**, and the freeze extends by roughly one more cooldown period. This was observed once in five presses during the measurement above (a 4000 ms freeze instead of 1904 ms).
+
+It is a device limitation, not something the helper can work around — the arrival of a Still-pin sample *is* the trigger, and there is no sample to react to. The practical fix is in the UI: disable the capture affordance for ~2 s after each press, which turns an impossible input into one that simply isn't accepted. A `?after=` long-poll timing out at 8 s is the other signal for the same condition.
+
+Presses spaced 4–6 s apart were accepted 5 out of 5.
 
 ---
 
@@ -545,11 +661,16 @@ windows-helper/
     └── DermoscopeHelper-Setup-X.Y.Z.exe
 ```
 
-At runtime, tray mode writes `helper.log` (and, after a rotation, `helper.log.1`) next to `helper.exe` itself — the exe's own folder, not the current working directory.
-
 The `[git-ignored]` directories are listed explicitly in the repo root [`.gitignore`](../.gitignore); no built binary is ever committed. Released exes live on the [Releases page](https://github.com/ronpik/indmu-dermoscope-button-listener/releases), not in the tree.
 
-At runtime, tray mode writes `helper.log` (and, after a rotation, `helper.log.1`) next to `helper.exe` itself — the exe's own folder, not the current working directory. That is true wherever `helper.exe` came from, including a copy downloaded from Releases.
+Everything the helper reads or writes at runtime lives **next to `helper.exe` itself** — the exe's own folder, not the current working directory. That is true wherever `helper.exe` came from, including a copy downloaded from Releases:
+
+| File | Direction | Notes |
+|---|---|---|
+| [`helper-config.txt`](#configuration-file-helper-configtxt) | read at startup | Optional. Absent means built-in defaults. |
+| `helper.log` | written in tray mode | Rotated once to `helper.log.1` past ~1 MB. |
+
+Neither is a build output, so neither appears in the tree above; create `helper-config.txt` yourself if you need it.
 
 ---
 
