@@ -544,6 +544,40 @@ static void configure_format(IBaseFilter *pSrc, ICaptureGraphBuilder2 *pBuilder,
     pCfg->Release();
 }
 
+// Diagnostic: does this driver expose a JPEG quality/compression knob? If it does,
+// preview payload could shrink without lowering resolution or transcoding. Most UVC
+// drivers do not implement IAMVideoCompression at all; log either way so the answer
+// is on record instead of assumed.
+static void log_compression_caps(IBaseFilter *pSrc, ICaptureGraphBuilder2 *pBuilder,
+                                 const GUID *pinCategory) {
+    if (!pSrc || !pBuilder) return;
+    IAMVideoCompression *pComp = NULL;
+    HRESULT hr = pBuilder->FindInterface(pinCategory, &MEDIATYPE_Video, pSrc,
+                                         IID_IAMVideoCompression, (void**)&pComp);
+    if (FAILED(hr) || !pComp) {
+        log_ts("compression: IAMVideoCompression not exposed (0x%08lX) "
+               "- no driver-side quality knob", (unsigned long)hr);
+        return;
+    }
+    WCHAR ver[128] = {0}, desc[128] = {0};
+    int cbVer = sizeof(ver), cbDesc = sizeof(desc);
+    long defKeyRate = 0, defPPerKey = 0, caps = 0;
+    double defQuality = 0.0;
+    HRESULT ghr = pComp->GetInfo(ver, &cbVer, desc, &cbDesc,
+                                 &defKeyRate, &defPPerKey, &defQuality, &caps);
+    if (SUCCEEDED(ghr)) {
+        log_ts("compression: desc='%ls' caps=0x%lX defaultQuality=%.3f CanQuality=%s",
+               desc, (unsigned long)caps, defQuality,
+               (caps & CompressionCaps_CanQuality) ? "YES" : "no");
+    } else {
+        log_ts("compression: IAMVideoCompression present but GetInfo failed (0x%08lX)",
+               (unsigned long)ghr);
+    }
+    double q = 0.0;
+    if (SUCCEEDED(pComp->get_Quality(&q))) log_ts("compression: current quality=%.3f", q);
+    pComp->Release();
+}
+
 // SCAFFOLDING -- NOT FOR RELEASE. Cross-session coordination channel for the
 // preview-perf experiments: the helper is the only surface both the Windows
 // (helper) and Mac (web app) sides can see, and the Mac polls /health every
@@ -1213,7 +1247,8 @@ static HelperState start_capture() {
 
     // Capture pin at 1600x1200 MJPG: live preview + source of /still snapshot.
     // Still pin at 320x240 MJPG: hardware-button trigger only; bytes discarded.
-    configure_format(g_cap.pSrc, g_cap.pBuilder, &PIN_CATEGORY_CAPTURE, 1280, 960);
+    configure_format(g_cap.pSrc, g_cap.pBuilder, &PIN_CATEGORY_CAPTURE, 1024, 768);
+    log_compression_caps(g_cap.pSrc, g_cap.pBuilder, &PIN_CATEGORY_CAPTURE);
     configure_format(g_cap.pSrc, g_cap.pBuilder, &PIN_CATEGORY_STILL,    320,  240);
 
     // Capture pin -> Preview SampleGrabber -> NullRenderer
