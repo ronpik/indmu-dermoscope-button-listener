@@ -74,6 +74,7 @@
 #include <condition_variable>
 #include <vector>
 #include <set>
+#include <deque>
 #include <atomic>
 #include <chrono>
 
@@ -172,6 +173,56 @@ static std::atomic<long long> g_sessionStartMs{0};
 // sets it again.
 static std::atomic<bool> g_serverRunning{false};
 
+// ---- /health instrumentation (read-only for HTTP handlers) ----
+// configure_format() records the winning Capture-pin MJPG mode here so the
+// yardstick for every preview-perf experiment is visible in /health without
+// re-reading the driver.
+static std::atomic<int> g_captureWidth{0};
+static std::atomic<int> g_captureHeight{0};
+static std::atomic<long long> g_captureFrameInterval100ns{0};
+
+// Every BufferCB early-return (bogus buffer, FRAME_SKIP drop, try_lock miss,
+// future publish-time filters) bumps this. preview_frames + rejected across a
+// window ~= driver input fps.
+static std::atomic<long long> g_previewFramesRejected{0};
+
+// Number of live /preview streaming loops. Maintained by an RAII guard around
+// the streaming loop in serve_client() (see /preview below).
+static std::atomic<int> g_previewClients{0};
+
+// Rolling published-fps meter (last <=64 publish timestamps within a 10 s
+// window). note() runs on the DirectShow callback thread; rate_hz() runs on
+// HTTP threads. Its own mutex, so /health readers never contend g_previewMutex.
+class PreviewFpsMeter {
+    std::mutex mu_;
+    std::deque<long long> ts_ms_;
+    static constexpr size_t MAX_SAMPLES = 64;
+    static constexpr long long WINDOW_MS = 10000;
+    static long long now_ms() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+public:
+    void note() {
+        long long n = now_ms();
+        std::lock_guard<std::mutex> lk(mu_);
+        ts_ms_.push_back(n);
+        while (ts_ms_.size() > MAX_SAMPLES) ts_ms_.pop_front();
+        while (!ts_ms_.empty() && n - ts_ms_.front() > WINDOW_MS) ts_ms_.pop_front();
+    }
+    double rate_hz() {
+        long long n = now_ms();
+        std::lock_guard<std::mutex> lk(mu_);
+        while (!ts_ms_.empty() && n - ts_ms_.front() > WINDOW_MS) ts_ms_.pop_front();
+        if (ts_ms_.size() < 2) return 0.0;
+        double span_s = (double)(ts_ms_.back() - ts_ms_.front()) / 1000.0;
+        if (span_s <= 0.0) return 0.0;
+        return (double)(ts_ms_.size() - 1) / span_s;
+    }
+    void reset() { std::lock_guard<std::mutex> lk(mu_); ts_ms_.clear(); }
+};
+static PreviewFpsMeter g_previewFps;
+
 enum class HelperState { Stopped, Running, DeviceNotFound, CameraBusy, Error };
 static std::atomic<HelperState> g_state{HelperState::Stopped};
 
@@ -255,14 +306,18 @@ public:
     ULONG STDMETHODCALLTYPE Release() override { return InterlockedDecrement(&ref); }
     HRESULT STDMETHODCALLTYPE SampleCB(double, IMediaSample*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE BufferCB(double, BYTE *pBuf, long len) override {
-        if (len <= 0 || !pBuf) return S_OK;
-        if ((InterlockedIncrement(&frame_count) % FRAME_SKIP) != 0) return S_OK;
+        if (len <= 0 || !pBuf) { g_previewFramesRejected.fetch_add(1); return S_OK; }
+        if ((InterlockedIncrement(&frame_count) % FRAME_SKIP) != 0) {
+            g_previewFramesRejected.fetch_add(1); return S_OK;
+        }
         std::unique_lock<std::mutex> lk(g_previewMutex, std::try_to_lock);
-        if (!lk.owns_lock()) return S_OK;
+        if (!lk.owns_lock()) { g_previewFramesRejected.fetch_add(1); return S_OK; }
         if (g_latestPreview.size() != (size_t)len) g_latestPreview.resize((size_t)len);
         memcpy(g_latestPreview.data(), pBuf, (size_t)len);
         g_previewSeq.fetch_add(1);
         g_previewCV.notify_all();
+        lk.unlock();
+        g_previewFps.note();
         return S_OK;
     }
 };
@@ -452,8 +507,21 @@ static void configure_format(IBaseFilter *pSrc, ICaptureGraphBuilder2 *pBuilder,
     }
     free(caps);
     if (bestMT) {
-        log_ts("Setting format MJPG %dx%d on pin", bestW, bestH);
+        long long avgTimePerFrame = 0;
+        if (bestMT->formattype == FORMAT_VideoInfo && bestMT->pbFormat) {
+            avgTimePerFrame = (long long)((VIDEOINFOHEADER*)bestMT->pbFormat)->AvgTimePerFrame;
+        }
+        log_ts("Setting format MJPG %dx%d on pin (AvgTimePerFrame=%lld 100ns)",
+               bestW, bestH, avgTimePerFrame);
         pCfg->SetFormat(bestMT);
+        // Record the winning Capture-pin mode for /health. The Still pin runs a
+        // separate small resolution used only as a trigger; ignore it here so
+        // /health always reports the pin whose bytes actually reach /preview.
+        if (IsEqualGUID(*pinCategory, PIN_CATEGORY_CAPTURE)) {
+            g_captureWidth.store(bestW);
+            g_captureHeight.store(bestH);
+            g_captureFrameInterval100ns.store(avgTimePerFrame);
+        }
         free_mt(bestMT);
     }
     pCfg->Release();
@@ -620,6 +688,15 @@ static void handle_client(SOCKET sock) {
             "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
         send_all(sock, hdr, (int)strlen(hdr));
 
+        // RAII counter for /health preview_clients. Increments on entry, and
+        // decrements on every exit path from the streaming loop below (return,
+        // break, exception), so a browser closing a tab is reflected in the
+        // next /health poll without any explicit bookkeeping in the loop.
+        struct PreviewClientGuard {
+            PreviewClientGuard()  { g_previewClients.fetch_add(1); }
+            ~PreviewClientGuard() { g_previewClients.fetch_sub(1); }
+        } previewClientGuard;
+
         // Start from the CURRENT sequence number, not -1: with -1 a client that
         // connects before the first frame arrives would immediately pass the
         // predicate and emit an empty Content-Length: 0 part.
@@ -699,12 +776,28 @@ static void handle_client(SOCKET sock) {
             std::chrono::steady_clock::now().time_since_epoch()).count();
         long long uptimeS = (startMs > 0 && nowMs > startMs) ? (nowMs - startMs) / 1000 : 0;
 
+        int capW = g_captureWidth.load();
+        int capH = g_captureHeight.load();
+        long long capInterval = g_captureFrameInterval100ns.load();
+        double capInputFps = (capInterval > 0) ? (1.0e7 / (double)capInterval) : 0.0;
+        double previewFps = g_previewFps.rate_hz();
+        char fpsBuf[32], inFpsBuf[32];
+        snprintf(fpsBuf,   sizeof(fpsBuf),   "%.2f", previewFps);
+        snprintf(inFpsBuf, sizeof(inFpsBuf), "%.2f", capInputFps);
+
         // status is always "running": the HTTP server -- and so /health --
         // only exists while capture is running (see the top of this file).
         std::string body;
         body += "{\"status\":\"running\",\"version\":\"" + json_escape(HELPER_VERSION) + "\"";
         body += ",\"device\":\"" + json_escape(device) + "\"";
+        body += ",\"capture_width\":" + std::to_string(capW);
+        body += ",\"capture_height\":" + std::to_string(capH);
+        body += ",\"capture_frame_interval_100ns\":" + std::to_string(capInterval);
+        body += ",\"capture_input_fps\":";  body += inFpsBuf;
         body += ",\"preview_frames\":" + std::to_string(g_previewSeq.load());
+        body += ",\"preview_frames_rejected\":" + std::to_string(g_previewFramesRejected.load());
+        body += ",\"preview_fps\":";        body += fpsBuf;
+        body += ",\"preview_clients\":" + std::to_string(g_previewClients.load());
         body += ",\"still_seq\":" + std::to_string(g_stillSeq.load());
         body += std::string(",\"still_available\":") + (stillAvailable ? "true" : "false");
         body += ",\"port\":" + std::to_string(g_port);
@@ -1010,6 +1103,11 @@ static void stop_capture() {
         g_deviceName.clear();
     }
     g_previewSeq.store(0);
+    g_previewFramesRejected.store(0);
+    g_previewFps.reset();
+    g_captureWidth.store(0);
+    g_captureHeight.store(0);
+    g_captureFrameInterval100ns.store(0);
     g_stillSeq.store(0);
     g_sessionStartMs.store(0);
 
