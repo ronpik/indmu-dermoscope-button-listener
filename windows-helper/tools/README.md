@@ -32,9 +32,21 @@ make camprobe                 # from windows-helper/, in an MSYS2 MINGW64 shell
 
 Exit code: `0` available, `1` blocked, `2` probe error.
 
-`camprobe` claims the camera for the duration of the run and releases it on
-exit, so **do not run it while the helper is meant to be capturing** — it will
-briefly compete for the device.
+> **Do not run `camprobe` (without `--list`) while the helper is capturing.**
+> It does not merely compete for the device — it corrupts it. On the HT-B30S,
+> one probe against a live helper permanently drops the **still pin** to the
+> capture pin's resolution (1600x1200 -> 1024x768) for the rest of the session,
+> while the pin continues to advertise 1600x1200. Only restarting capture
+> recovers it; the helper now rejects such frames outright (see
+> `still_frames_rejected` in `/health`), so the visible symptom is that button
+> presses stop producing stills.
+>
+> The cause is that `RenderStream` succeeds on the capture pin even when the
+> camera is busy and `Run` fails — the format negotiation lands before the
+> failure does. `--list` never builds a graph and is always safe.
+
+Use `--list` first. Reach for the full probe only when the helper is stopped, or
+when you have already accepted that capture will need a restart afterwards.
 
 ### Reading the output
 

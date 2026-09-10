@@ -132,6 +132,13 @@ static std::atomic<int> g_stillConfHeight{1200};
 // What the Still pin actually negotiated, which can differ from the above.
 static std::atomic<int> g_stillPinWidth{0};
 static std::atomic<int> g_stillPinHeight{0};
+static std::atomic<unsigned long long> g_stillFramesRejected{0};
+// What the still pin last handed us, accepted or not. Distinguishes "the pin
+// degraded" from "nobody pressed the button" in a support log, which the
+// accepted-only g_stillWidth/Height cannot do: on refusal those keep reporting
+// the last good still.
+static std::atomic<int> g_stillLastDeliveredWidth{0};
+static std::atomic<int> g_stillLastDeliveredHeight{0};
 
 // Identifies this capture session. An app holding a still_seq across a restart
 // would otherwise long-poll ?after=<old seq> forever against a counter that has
@@ -562,6 +569,24 @@ public:
         }
         int sw = 0, sh = 0;
         bool haveDims = jpeg_dimensions(pBuf, frameLen, &sw, &sh);
+        // This device can silently drop its still pin to the capture pin's
+        // resolution mid-session while continuing to advertise the negotiated
+        // still format, so the media type cannot be trusted -- only the pixels
+        // can. Serving the result anyway would hand a clinician a preview-grade
+        // image labelled as a full-sensor still, which is worse than no image:
+        // the degradation is invisible in the UI. Refuse it, leave /still and
+        // still_seq untouched, and send no F9, exactly as for an unusable buffer.
+        g_stillLastDeliveredWidth.store(haveDims ? sw : 0);
+        g_stillLastDeliveredHeight.store(haveDims ? sh : 0);
+        int pinW = g_stillPinWidth.load(), pinH = g_stillPinHeight.load();
+        if (haveDims && pinW > 0 && pinH > 0 && (sw != pinW || sh != pinH)) {
+            g_stillFramesRejected.fetch_add(1);
+            log_ts("  still trigger -> device delivered %dx%d but the still pin "
+                   "negotiated %dx%d; REJECTED, /still unchanged, NO F9 sent. "
+                   "The still pin has degraded -- restart capture to recover.",
+                   sw, sh, pinW, pinH);
+            return S_OK;
+        }
         {
             std::lock_guard<std::mutex> slk(g_stillMutex);
             g_latestStill.assign(pBuf, pBuf + frameLen);
@@ -1202,6 +1227,11 @@ static void handle_client(SOCKET sock) {
         body += ",\"configured_height\":" + std::to_string(g_configuredHeight.load());
         body += ",\"still_pin_width\":" + std::to_string(g_stillPinWidth.load());
         body += ",\"still_pin_height\":" + std::to_string(g_stillPinHeight.load());
+        // Nonzero means presses are being dropped on purpose. Without this the
+        // rejection is invisible to a client: still_seq simply stops advancing.
+        body += ",\"still_frames_rejected\":" + std::to_string(g_stillFramesRejected.load());
+        body += ",\"still_last_delivered_width\":" + std::to_string(g_stillLastDeliveredWidth.load());
+        body += ",\"still_last_delivered_height\":" + std::to_string(g_stillLastDeliveredHeight.load());
         body += ",\"still_seq\":" + std::to_string(g_stillSeq.load());
         body += std::string(",\"still_available\":") + (stillAvailable ? "true" : "false");
         // Read from the still's own SOF header, so this reports what the device
@@ -1542,6 +1572,9 @@ static void stop_capture() {
     g_sessionStartMs.store(0);
     g_stillPinWidth.store(0);
     g_stillPinHeight.store(0);
+    g_stillFramesRejected.store(0);
+    g_stillLastDeliveredWidth.store(0);
+    g_stillLastDeliveredHeight.store(0);
     // Everything /health derives from the still that g_latestStill.clear()
     // just discarded. Left alone, a session with still_available=false would
     // still report the previous session's still_width/height.
