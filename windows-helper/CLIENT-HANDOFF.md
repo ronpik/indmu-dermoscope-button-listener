@@ -106,7 +106,14 @@ document.addEventListener('keydown', async e => {
 
 **Don't strip `X-Still-Seq` through a proxy.** The helper sends `Access-Control-Expose-Headers: X-Still-Seq` alongside it; without that header a cross-origin `fetch` cannot read the sequence number at all, and `headers.get()` returns `null` with no error explaining why.
 
-**Not every press produces an F9.** If the device delivers an unusable buffer, the helper keeps the previous image and sends **no keystroke** — so a failed capture looks like "the button did nothing" rather than silently re-saving the previous lesion. Don't build logic that assumes press ⇒ F9.
+**Not every press produces an F9.** If the device delivers an unusable buffer, or delivers a frame below the resolution its Still pin negotiated, the helper keeps the previous image, leaves `still_seq` unchanged and sends **no keystroke** — so a failed capture looks like "the button did nothing" rather than silently re-saving the previous lesion. Don't build logic that assumes press ⇒ F9.
+
+The second case is worth surfacing in the UI, because it is **sticky**: this device can silently drop its Still pin to preview resolution mid-session while still advertising 1600×1200, and pressing again will keep failing until capture is restarted. `/health` reports it:
+
+* **`still_frames_rejected`** — count of presses refused this run. If it increments while a capture dialog is open, tell the clinician *"The dermoscope stopped delivering full-resolution images. Reconnect the device or restart the helper."* Leading with the recovery action matters; "press again" is wrong advice here.
+* **`still_last_delivered_width` / `still_last_delivered_height`** — what the pin actually handed over last, accepted or not. Distinguishes "the pin degraded" from "nobody pressed the button" in a support log, which `still_width`/`still_height` cannot: those keep reporting the last *good* still.
+
+Both reset per run, alongside `still_seq` and `run_id`.
 
 ### 2b. Optional: on-screen capture button → `GET /snapshot`
 

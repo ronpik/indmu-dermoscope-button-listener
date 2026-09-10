@@ -371,7 +371,7 @@ If `configured_*` and `capture_*` disagree, the mode you asked for does not exis
 
 ### Log output
 
-Every accepted still is logged with byte size and "sending F9"; debounced triggers are logged with a `DEBOUNCED` tag. Where that goes depends on the mode:
+Every accepted still is logged with byte size and "sending F9"; debounced triggers are logged with a `DEBOUNCED` tag, and presses refused for unusable bytes or wrong resolution are logged with the reason and "NO F9 sent". Where that goes depends on the mode:
 
 - **`--console`** — **stderr**, same format as before.
 - **tray mode (the default)** — `helper.log` in the same folder as `helper.exe`, flushed line by line so it's still useful if the process is killed. If the file has grown past roughly 1 MB it's rotated once at startup to `helper.log.1`; only that one previous log is kept.
@@ -471,6 +471,9 @@ Returns `200 application/json` whenever the helper's HTTP server is up — the r
   "preview_input_fps": 6.82,
   "preview_clients": 1,
   "still_seq": 3,
+  "still_frames_rejected": 0,
+  "still_last_delivered_width": 1600,
+  "still_last_delivered_height": 1200,
   "still_available": true,
   "still_width": 1600,
   "still_height": 1200,
@@ -496,7 +499,9 @@ Returns `200 application/json` whenever the helper's HTTP server is up — the r
 | `preview_frames_in`, `_skipped`, `_dropped_busy`, `_rejected` | Frame accounting: received, deliberately skipped, dropped because the buffer was locked, and rejected as malformed. |
 | `preview_clients` | Number of `/preview` streams currently attached. |
 | `capture_frame_interval_100ns`, `capture_advertised_fps` | What the driver *claims* the capture pin runs at. **Advertised fps is not reliable on this device** (it reports 15 fps at every mode while delivering ~6.8); trust `preview_input_fps` instead. |
-| `still_seq` | Running count of accepted (non-debounced) button presses since this session started. Increments **before** the F9 keystroke is sent. |
+| `still_seq` | Running count of accepted button presses since this session started. Increments **before** the F9 keystroke is sent. Presses that were debounced, delivered unusable bytes, or were refused for wrong resolution do **not** increment it. |
+| `still_frames_rejected` | Count of presses refused because the delivered frame did not match `still_pin_width`/`_height` — see [The Still pin can degrade mid-session](#the-still-pin-can-degrade-mid-session). Non-zero means presses are being dropped deliberately; a client watching only `still_seq` would see nothing at all. |
+| `still_last_delivered_width` / `_height` | What the Still pin handed over on the last press, **accepted or refused**. Distinguishes "the pin degraded" from "nobody pressed the button", which `still_width`/`_height` cannot — those keep reporting the last *good* still. `0` when nothing has been delivered yet or the SOF was unreadable. |
 | `still_available` | Whether `/still` currently has an image to serve — `false` until the first button press of this session. |
 | `still_width` / `_height` | Dimensions parsed from the stored still's **own JPEG SOF header**, so this is what the device actually produced rather than what the pin was asked for. `0` when nothing has been captured yet. |
 | `still_last_ms_ago` | Milliseconds since the last still was stored; `-1` if there hasn't been one. |
@@ -647,6 +652,24 @@ It is a device limitation, not something the helper can work around — the arri
 
 Presses spaced 4–6 s apart were accepted every time — 11 of the 12 logged presses, with the single rejection being the one deliberately made inside the cooldown.
 
+### The Still pin can degrade mid-session
+
+The device can silently drop its Still pin to the capture pin's resolution — 1600×1200 down to 1024×768 — partway through a session, **while continuing to advertise the negotiated 1600×1200 format**. The media type therefore cannot be trusted; only the decoded pixels can. The state is sticky: every subsequent press delivers a degraded frame until capture is restarted.
+
+Serving such a frame would hand a clinician a preview-grade image labelled as a full-sensor still, which is worse than no image because the degradation is invisible in the UI. So `StillCB::BufferCB` compares each decoded frame against `still_pin_width`/`_height` and refuses a mismatch: `/still` and `still_seq` are left untouched and **no F9 is sent**, exactly as for an unusable buffer.
+
+```
+[19:27:19.409]   still trigger -> device delivered 1024x768 but the still pin negotiated
+                 1600x1200; REJECTED, /still unchanged, NO F9 sent. The still pin has
+                 degraded -- restart capture to recover.
+```
+
+F9 is deliberately withheld rather than sent to signal the failure. It is a global keystroke and the helper cannot know what has focus, so a client that answered it with a bare `GET /still` would receive **200 plus the previous still's bytes** as if freshly captured — a wrong lesion presented as a fresh capture, strictly worse than the wrong resolution being prevented. `still_frames_rejected` on `/health` is the intended signal instead; a UI should lead with the recovery action ("reconnect the device or restart the helper"), because "press again" is wrong advice for a sticky state.
+
+**Known trigger: `tools/camprobe` run against a live helper.** Its `RenderStream` succeeds on the capture pin even when `Run` fails on a busy camera, and that renegotiation is enough to degrade the Still pin. Reproduced on demand: restart → press → 1600×1200; one camprobe run; press → 1024×768. See [`tools/README.md`](tools/README.md). Whether anything reachable by normal use causes the same degradation is not known — if `still_frames_rejected` is ever non-zero on a machine where camprobe was never run, that is a second cause and worth capturing the log for.
+
+Two independent signals corroborate a real capture, useful when diagnosing this without decoding JPEGs: `preview_max_gap_ms_since_still` is ~2048 ms after a genuine full-sensor still but only ~430 ms after a degraded one, and a genuine still increments `preview_frames_rejected` (the capture stream is spliced by the bandwidth spike) while a degraded one does not.
+
 ---
 
 ## File layout
@@ -655,9 +678,15 @@ Presses spaced 4–6 s apart were accepted every time — 11 of the 12 logged pr
 windows-helper/
 ├── README.md          -- this file
 ├── CLIENT-HANDOFF.md  -- what to send a pilot customer, and how they run it
-├── Makefile           -- shared + static build targets, VERSION stamping
+├── Makefile           -- shared + static build targets, VERSION stamping, `test`, `camprobe`
 ├── helper.cpp         -- single-file implementation
+├── mjpeg_frame.h      -- MJPEG frame-boundary parser, split out so it can be unit tested
+│                         without linking DirectShow
+├── test_mjpeg_frame.cpp -- unit tests for the above (`make test`, also run in CI)
 ├── helper.rc          -- Win32 resources: version info + app icon (ID 101)
+├── tools/             -- standalone debugging utilities, not shipped to users
+│   ├── README.md      -- what each tool answers, and findings established with them
+│   └── camprobe.cpp   -- "is the camera actually free right now?" (`make camprobe`)
 ├── assets/
 │   ├── helper.ico          -- app icon, resource ID 101 (tracked source, not build output)
 │   ├── helper.png          -- 256px PNG render of the same icon, for docs/installer wizard images
