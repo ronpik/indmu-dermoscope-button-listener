@@ -184,17 +184,21 @@ The resource script is [`helper.rc`](helper.rc). Besides the version block it em
 | Target | Output | Size | Notes |
 |---|---|---|---|
 | `make shared` | `dist/helper.exe` + `libstdc++-6.dll`, `libgcc_s_seh-1.dll`, `libwinpthread-1.dll` | ~870 KB exe + ~2.7 MB DLLs | Ship the whole folder. DLLs are the mingw-w64 C/C++ runtime. Local builds only — never published to a release. |
-| `make static` | `dist-static/helper.exe` | ~3.4 MB single file | No external deps. Drop anywhere and run. Slower to link, larger binary. **This is the build the Releases page ships.** |
+| `make static` | `dist-static/helper.exe` | ~1.4 MB single file | No external deps. Drop anywhere and run. Slower to link. **This is the build the Releases page ships.** The exact size depends on the mingw-w64 runtime that was linked in — a toolchain update has moved it by more than 2 MB before — so verify a download by its SHA256, never by its byte count. |
 
-Both link against **only inbox Windows DLLs** at runtime:
+Both link against **only inbox Windows DLLs** at runtime. In the import table (`objdump -p helper.exe | grep 'DLL Name'`):
 - `KERNEL32.dll`, `USER32.dll` — base Win32
-- `ole32.dll`, `oleaut32.dll` — COM (DirectShow is COM-based)
-- `strmiids` symbols — compile-time only; resolved into the binary
-- `ws2_32.dll` — Winsock 2
-- `quartz.dll` — DirectShow graph manager
-- `qedit.dll` — `CLSID_SampleGrabber`, `CLSID_NullRenderer`
-- `shell32.dll` — the tray icon (`Shell_NotifyIcon`) and **Open test page** (`ShellExecute`)
-- `gdi32.dll` — loaded dynamically at startup only, to build the greyed-out icon variant. If it cannot be loaded the helper simply uses one icon for every state.
+- `msvcrt.dll` — the C runtime mingw-w64 targets
+- `ole32.dll`, `OLEAUT32.dll` — COM (DirectShow is COM-based)
+- `WS2_32.dll` — Winsock 2
+- `SHELL32.dll` — the tray icon (`Shell_NotifyIcon`) and **Open test page** (`ShellExecute`)
+
+Loaded at runtime rather than imported, so they do not appear in that list:
+- `quartz.dll` — DirectShow graph manager, via `CoCreateInstance`
+- `qedit.dll` — `CLSID_SampleGrabber`, `CLSID_NullRenderer`, via `CoCreateInstance`
+- `gdi32.dll` — `LoadLibrary` at startup only, to build the greyed-out icon variant. If it cannot be loaded the helper simply uses one icon for every state.
+
+`strmiids` symbols are compile-time only and resolved into the binary.
 
 All of those are present on every Windows 7/8/10/11 installation. No Visual C++ Redistributable required.
 
@@ -367,7 +371,7 @@ If `configured_*` and `capture_*` disagree, the mode you asked for does not exis
 
 ### Log output
 
-Every accepted still is logged with byte size and "sending F9"; debounced triggers are logged with a `DEBOUNCED` tag. Where that goes depends on the mode:
+Every accepted still is logged with byte size and "sending F9"; debounced triggers are logged with a `DEBOUNCED` tag, and presses refused for unusable bytes or wrong resolution are logged with the reason and "NO F9 sent". Where that goes depends on the mode:
 
 - **`--console`** — **stderr**, same format as before.
 - **tray mode (the default)** — `helper.log` in the same folder as `helper.exe`, flushed line by line so it's still useful if the process is killed. If the file has grown past roughly 1 MB it's rotated once at startup to `helper.log.1`; only that one previous log is kept.
@@ -395,6 +399,8 @@ Multipart MJPEG stream (`multipart/x-mixed-replace; boundary=frame`) at the [con
 Browser support is universal. You can also read the same URL with `fetch()` and parse the multipart stream yourself if you want the raw frames in JS, but for rendering there's no reason to. It is **not** usable with `EventSource` — that requires `text/event-stream`, and this is `multipart/x-mixed-replace`.
 
 Response headers include `Access-Control-Allow-Origin: *` so the endpoint can be consumed from any origin.
+
+Every viewer receives every published frame: opening the built-in test page beside the clinical app does not reduce the app's frame rate, but each extra viewer is another full-rate stream on the wire (~290 KB per frame at the default 1024×768). On a link that is already the bottleneck, close test pages you are not looking at. `preview_clients` on `/health` shows how many are attached.
 
 Query strings are stripped before routing, so the common cache-busting pattern `/preview?t=${Date.now()}` works as expected — see "Recovering from a Stop/Start cycle" below for why you'd want that. They are *ignored* everywhere except `/still`, which reads `?after=<seq>` out of the query string to long-poll (see below); a cache-buster there is harmless as long as you keep `after=` intact.
 
@@ -465,6 +471,9 @@ Returns `200 application/json` whenever the helper's HTTP server is up — the r
   "preview_input_fps": 6.82,
   "preview_clients": 1,
   "still_seq": 3,
+  "still_frames_rejected": 0,
+  "still_last_delivered_width": 1600,
+  "still_last_delivered_height": 1200,
   "still_available": true,
   "still_width": 1600,
   "still_height": 1200,
@@ -490,11 +499,13 @@ Returns `200 application/json` whenever the helper's HTTP server is up — the r
 | `preview_frames_in`, `_skipped`, `_dropped_busy`, `_rejected` | Frame accounting: received, deliberately skipped, dropped because the buffer was locked, and rejected as malformed. |
 | `preview_clients` | Number of `/preview` streams currently attached. |
 | `capture_frame_interval_100ns`, `capture_advertised_fps` | What the driver *claims* the capture pin runs at. **Advertised fps is not reliable on this device** (it reports 15 fps at every mode while delivering ~6.8); trust `preview_input_fps` instead. |
-| `still_seq` | Running count of accepted (non-debounced) button presses since this session started. Increments **before** the F9 keystroke is sent. |
+| `still_seq` | Running count of accepted button presses since this session started. Increments **before** the F9 keystroke is sent. Presses that were debounced, delivered unusable bytes, or were refused for wrong resolution do **not** increment it. |
+| `still_frames_rejected` | Count of presses refused because the delivered frame did not match `still_pin_width`/`_height` — see [The Still pin can degrade mid-session](#the-still-pin-can-degrade-mid-session). Non-zero means presses are being dropped deliberately; a client watching only `still_seq` would see nothing at all. |
+| `still_last_delivered_width` / `_height` | What the Still pin handed over on the last press, **accepted or refused**. Distinguishes "the pin degraded" from "nobody pressed the button", which `still_width`/`_height` cannot — those keep reporting the last *good* still. `0` when nothing has been delivered yet or the SOF was unreadable. |
 | `still_available` | Whether `/still` currently has an image to serve — `false` until the first button press of this session. |
 | `still_width` / `_height` | Dimensions parsed from the stored still's **own JPEG SOF header**, so this is what the device actually produced rather than what the pin was asked for. `0` when nothing has been captured yet. |
 | `still_last_ms_ago` | Milliseconds since the last still was stored; `-1` if there hasn't been one. |
-| `preview_max_gap_ms_since_still` | Largest gap between preview frames since the last still, reset on every still. The device freezes the preview for roughly **2 s** while it produces a still, so shortly after a press this reads ~2000; in steady state it sits near the nominal frame interval (~147 ms at 6.8 fps). |
+| `preview_max_gap_ms_since_still` | Largest gap between preview frames since the last still, reset to 0 on every still. **It reads `0` for the whole ∼2 s freeze and only becomes ∼2048 once the freeze ends** — the value is computed when a frame arrives, and during the freeze no frame arrives. Polling right after a press, which is the obvious moment, therefore gives 0; wait for it to become non-zero, or read it before the next press. In steady state it sits near the nominal frame interval (~147 ms at 6.8 fps). |
 | `port` | The TCP port the helper is actually listening on. |
 | `uptime_s` | Seconds since this capture session started (the last Start, including the automatic one at launch). |
 
@@ -609,7 +620,7 @@ Only one app can stream from the dermoscope at a time on Windows. If anything el
 
 While the device produces a still, its firmware stops delivering frames on the capture pin, so the live preview freezes. This is the device's behaviour, not a helper stall, and it is the price of real full-resolution device stills.
 
-Measured on the HT-B30S with the Still pin at 1600×1200, across 11 accepted presses in three sessions:
+Measured on the HT-B30S with the Still pin at 1600×1200, across 14 accepted presses in four sessions:
 
 | | |
 |---|---|
@@ -618,7 +629,16 @@ Measured on the HT-B30S with the Still pin at 1600×1200, across 11 accepted pre
 
 Budget for ~2 s rather than a tighter figure: a single run can look far more consistent than the device is. Four consecutive presses in one session landed within 2 ms of each other (1903 / 1905 / 1904 / 1903), but across sessions the same measurement spans ~350 ms, so that tightness is not something to design against.
 
-There is no gradual ramp: frame 1 after the still shows the ~2 s gap, frame 2 is back to ~128–147 ms (nominal is 147 ms at 6.8 fps), so a "recovering" UI state isn't warranted. `preview_max_gap_ms_since_still` on `/health` reports this per capture.
+There is no gradual ramp: frame 1 after the still shows the ~2 s gap, frame 2 is back to ~144–160 ms (nominal is 147 ms at 6.8 fps), so a "recovering" UI state isn't warranted. A representative trace of one capture:
+
+```
+[11:08:39.250]   still trigger -> /still 912592 bytes 1600x1200, sending F9
+[11:08:41.137]   post-still preview frame 1: gap 2048 ms, t+1887 ms
+[11:08:41.297]   post-still preview frame 2: gap 160 ms, t+2047 ms
+[11:08:41.441]   post-still preview frame 3: gap 144 ms, t+2191 ms
+```
+
+`preview_max_gap_ms_since_still` on `/health` reports this per capture, but note it only becomes non-zero at the `frame 1` line above — see its entry in the `/health` table.
 
 The image itself is ready at the **start** of that window — the bytes are stored and `still_seq` is bumped before the F9 keystroke is sent — so an app that renders the captured still immediately hides the freeze entirely.
 
@@ -626,11 +646,31 @@ Note this affects `/snapshot` too, since it serves preview frames: for ~2 s afte
 
 ### A press during the cooldown is silently swallowed
 
-If the button is pressed while the device is still in that ~2 s window, the firmware discards it: `StillCB::BufferCB` is never called, so there is **no still, no `still_seq` increment and no F9**, and the freeze extends by roughly one more cooldown period. Observed once in 12 logged presses — a 4145 ms stall instead of the usual ~2000 ms. Note the press leaves no log line of its own, so a long stall is the only evidence it happened.
+If the button is pressed while the device is still in that ~2 s window, the firmware discards it: `StillCB::BufferCB` is never called, so there is **no still, no `still_seq` increment and no F9**, and the freeze extends by roughly one more cooldown period. Observed 3 times in 19 logged presses — stalls of 4143, 4145 and 4447 ms instead of the usual ~2048. Note the press leaves no log line of its own, so a long stall is the only evidence it happened; a `post-still preview frame 1` gap of roughly double the usual is the signature.
 
 It is a device limitation, not something the helper can work around — the arrival of a Still-pin sample *is* the trigger, and there is no sample to react to. The practical fix is in the UI: disable the capture affordance for ~2 s after each press, which turns an impossible input into one that simply isn't accepted. A `?after=` long-poll timing out at 8 s is the other signal for the same condition.
 
 Presses spaced 4–6 s apart were accepted every time — 11 of the 12 logged presses, with the single rejection being the one deliberately made inside the cooldown.
+
+### The Still pin can degrade mid-session
+
+The device can silently drop its Still pin to the capture pin's resolution — 1600×1200 down to 1024×768 — partway through a session, **while continuing to advertise the negotiated 1600×1200 format**. The media type therefore cannot be trusted; only the decoded pixels can. The state is sticky: every subsequent press delivers a degraded frame until capture is restarted.
+
+Note the Still pin's own mode list is `1600x1200, 1280x1024, 1280x960, 800x600, 640x480, 352x288, 320x240` — **1024×768 is not on it**. So this is not the pin renegotiating to a lower still mode, because that mode does not exist for it; the pin is delivering *capture-pin* frames. That is why the advertised media type stays truthful at 1600×1200: the pin's negotiated format really is unchanged, it is simply handing over another pin's buffers. Hence a pixel-level check is the only thing that can catch it.
+
+Serving such a frame would hand a clinician a preview-grade image labelled as a full-sensor still, which is worse than no image because the degradation is invisible in the UI. So `StillCB::BufferCB` compares each decoded frame against `still_pin_width`/`_height` and refuses a mismatch: `/still` and `still_seq` are left untouched and **no F9 is sent**, exactly as for an unusable buffer.
+
+```
+[19:27:19.409]   still trigger -> device delivered 1024x768 but the still pin negotiated
+                 1600x1200; REJECTED, /still unchanged, NO F9 sent. The still pin has
+                 degraded -- restart capture to recover.
+```
+
+F9 is deliberately withheld rather than sent to signal the failure. It is a global keystroke and the helper cannot know what has focus, so a client that answered it with a bare `GET /still` would receive **200 plus the previous still's bytes** as if freshly captured — a wrong lesion presented as a fresh capture, strictly worse than the wrong resolution being prevented. `still_frames_rejected` on `/health` is the intended signal instead; a UI should lead with the recovery action ("reconnect the device or restart the helper"), because "press again" is wrong advice for a sticky state.
+
+**Known trigger: `tools/camprobe` run against a live helper.** Its `RenderStream` succeeds on the capture pin even when `Run` fails on a busy camera, and that renegotiation is enough to degrade the Still pin. Reproduced on demand: restart → press → 1600×1200; one camprobe run; press → 1024×768. See [`tools/README.md`](tools/README.md). Whether anything reachable by normal use causes the same degradation is not known — if `still_frames_rejected` is ever non-zero on a machine where camprobe was never run, that is a second cause and worth capturing the log for.
+
+Two independent signals corroborate a real capture, useful when diagnosing this without decoding JPEGs: `preview_max_gap_ms_since_still` is ~2048 ms after a genuine full-sensor still but only ~430 ms after a degraded one, and a genuine still increments `preview_frames_rejected` (the capture stream is spliced by the bandwidth spike) while a degraded one does not.
 
 ---
 
@@ -640,9 +680,15 @@ Presses spaced 4–6 s apart were accepted every time — 11 of the 12 logged pr
 windows-helper/
 ├── README.md          -- this file
 ├── CLIENT-HANDOFF.md  -- what to send a pilot customer, and how they run it
-├── Makefile           -- shared + static build targets, VERSION stamping
+├── Makefile           -- shared + static build targets, VERSION stamping, `test`, `camprobe`
 ├── helper.cpp         -- single-file implementation
+├── mjpeg_frame.h      -- MJPEG frame-boundary parser, split out so it can be unit tested
+│                         without linking DirectShow
+├── test_mjpeg_frame.cpp -- unit tests for the above (`make test`, also run in CI)
 ├── helper.rc          -- Win32 resources: version info + app icon (ID 101)
+├── tools/             -- standalone debugging utilities, not shipped to users
+│   ├── README.md      -- what each tool answers, and findings established with them
+│   └── camprobe.cpp   -- "is the camera actually free right now?" (`make camprobe`)
 ├── assets/
 │   ├── helper.ico          -- app icon, resource ID 101 (tracked source, not build output)
 │   ├── helper.png          -- 256px PNG render of the same icon, for docs/installer wizard images

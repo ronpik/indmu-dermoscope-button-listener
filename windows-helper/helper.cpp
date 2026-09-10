@@ -55,12 +55,13 @@
 //
 // DirectShow graph:
 //   SourceFilter (HT-B30S)
-//     +-- Capture pin (MJPG 1600x1200) -> SampleGrabber (PreviewCB) -> NullRenderer
-//     |     -- feeds /preview (live) AND serves as the source of /still
-//     +-- Still pin   (MJPG 320x240)   -> SampleGrabber (StillCB)   -> NullRenderer
-//           -- used ONLY as the hardware-button trigger; bytes are discarded.
-//              On trigger, we snapshot the latest Capture-pin preview frame
-//              into the /still buffer so /still is always a 1600x1200 JPEG.
+//     +-- Capture pin (MJPG, configured preview mode) -> SampleGrabber (PreviewCB) -> NullRenderer
+//     |     -- feeds /preview (live stream) and /snapshot (latest frame).
+//     +-- Still pin   (MJPG, full sensor res)         -> SampleGrabber (StillCB)   -> NullRenderer
+//           -- delivers bytes ONLY on a hardware-button press. Those bytes ARE
+//              what /still serves: a real device still at the sensor's full
+//              resolution, never a frozen preview frame. Storing them is what
+//              then triggers the synthetic F9.
 //
 // Why single-click only: the device has a USB alt-setting threshold between
 // 320x240 and 640x480 on the Capture pin. Above 320x240 the bandwidth
@@ -91,6 +92,8 @@
 #include <deque>
 #include <atomic>
 #include <chrono>
+
+#include "mjpeg_frame.h"
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -129,10 +132,23 @@ static std::atomic<int> g_stillConfHeight{1200};
 // What the Still pin actually negotiated, which can differ from the above.
 static std::atomic<int> g_stillPinWidth{0};
 static std::atomic<int> g_stillPinHeight{0};
+static std::atomic<unsigned long long> g_stillFramesRejected{0};
+// What the still pin last handed us, accepted or not. Distinguishes "the pin
+// degraded" from "nobody pressed the button" in a support log, which the
+// accepted-only g_stillWidth/Height cannot do: on refusal those keep reporting
+// the last good still.
+static std::atomic<int> g_stillLastDeliveredWidth{0};
+static std::atomic<int> g_stillLastDeliveredHeight{0};
 
-// Identifies this run of the helper. An app holding a still_seq across a helper
-// restart would otherwise long-poll ?after=<old seq> forever against a counter
-// that has reset to 0; a changed run_id tells it to drop the stored value.
+// Identifies this capture session. An app holding a still_seq across a restart
+// would otherwise long-poll ?after=<old seq> forever against a counter that has
+// reset to 0; a changed run_id tells it to drop the stored value.
+//
+// Restamped per Start, not per process: tray Stop resets still_seq to 0 while
+// the process lives on, so a process-lifetime id would leave the counter running
+// backwards under an unchanged run_id -- exactly the case this field exists to
+// catch. Set in http_server_start(), the one point a client can begin observing
+// it, so it can never be seen out of step with the counter it guards.
 static long long g_runId = 0;
 
 // Builds a path to a file sitting next to the exe.
@@ -315,6 +331,13 @@ static std::atomic<long long> g_sessionStartMs{0};
 // that Stop -> Start cycles work: stop_capture() clears it, start_capture()
 // sets it again.
 static std::atomic<bool> g_serverRunning{false};
+// Bumped on every successful http_server_start(). http_server_stop() waits at
+// most 2 s for client threads to unwind, and a /preview thread stuck in send()
+// (bounded by SO_SNDTIMEO, not by shutdown()) can outlive that. Without this a
+// survivor would see g_serverRunning flip back to true on the next Start and
+// resume its loop against a session it never belonged to. Each /preview handler
+// records the generation it joined and exits as soon as that stops matching.
+static std::atomic<unsigned long long> g_serverGeneration{0};
 
 // ---- /health instrumentation (read-only for HTTP handlers) ----
 // configure_format() records the winning Capture-pin MJPG mode here so the
@@ -482,13 +505,17 @@ public:
             }
         }
         if (len <= 0 || !pBuf) { g_previewFramesRejected.fetch_add(1); return S_OK; }
+        // Trim to the first complete JPEG frame; rejects spliced buffers where
+        // the driver has concatenated two frames without EOI on the first one.
+        size_t frameLen = mjpeg_first_frame_size(pBuf, (size_t)len);
+        if (frameLen == 0) { g_previewFramesRejected.fetch_add(1); return S_OK; }
         if ((InterlockedIncrement(&frame_count) % FRAME_SKIP) != 0) {
             g_previewFramesSkipped.fetch_add(1); return S_OK;
         }
         std::unique_lock<std::mutex> lk(g_previewMutex, std::try_to_lock);
         if (!lk.owns_lock()) { g_previewFramesDroppedBusy.fetch_add(1); return S_OK; }
-        if (g_latestPreview.size() != (size_t)len) g_latestPreview.resize((size_t)len);
-        memcpy(g_latestPreview.data(), pBuf, (size_t)len);
+        if (g_latestPreview.size() != frameLen) g_latestPreview.resize(frameLen);
+        memcpy(g_latestPreview.data(), pBuf, frameLen);
         g_previewSeq.fetch_add(1);
         g_previewCV.notify_all();
         lk.unlock();
@@ -528,16 +555,41 @@ public:
         // These bytes ARE the device's still. Serving them is the whole point:
         // a preview snapshot would just be a frozen preview frame, not what the
         // camera produces when its button is pressed.
-        if (len <= 0 || !pBuf || pBuf[0] != 0xFF || pBuf[1] != 0xD8) {
+        // len is signed; guard before the size_t cast so a negative length
+        // cannot turn into a huge one and walk off the end of the buffer.
+        size_t frameLen = (len > 0 && pBuf) ? mjpeg_first_frame_size(pBuf, (size_t)len) : 0;
+        if (frameLen == 0) {
             log_ts("  still trigger -> device delivered %ld unusable bytes; "
                    "/still unchanged, NO F9 sent", len);
             return S_OK;
         }
+        if ((long)frameLen != len) {
+            log_ts("  still trigger -> trimmed buffer %ld -> %zu bytes (spliced or padded)",
+                   len, frameLen);
+        }
         int sw = 0, sh = 0;
-        bool haveDims = jpeg_dimensions(pBuf, (size_t)len, &sw, &sh);
+        bool haveDims = jpeg_dimensions(pBuf, frameLen, &sw, &sh);
+        // This device can silently drop its still pin to the capture pin's
+        // resolution mid-session while continuing to advertise the negotiated
+        // still format, so the media type cannot be trusted -- only the pixels
+        // can. Serving the result anyway would hand a clinician a preview-grade
+        // image labelled as a full-sensor still, which is worse than no image:
+        // the degradation is invisible in the UI. Refuse it, leave /still and
+        // still_seq untouched, and send no F9, exactly as for an unusable buffer.
+        g_stillLastDeliveredWidth.store(haveDims ? sw : 0);
+        g_stillLastDeliveredHeight.store(haveDims ? sh : 0);
+        int pinW = g_stillPinWidth.load(), pinH = g_stillPinHeight.load();
+        if (haveDims && pinW > 0 && pinH > 0 && (sw != pinW || sh != pinH)) {
+            g_stillFramesRejected.fetch_add(1);
+            log_ts("  still trigger -> device delivered %dx%d but the still pin "
+                   "negotiated %dx%d; REJECTED, /still unchanged, NO F9 sent. "
+                   "The still pin has degraded -- restart capture to recover.",
+                   sw, sh, pinW, pinH);
+            return S_OK;
+        }
         {
             std::lock_guard<std::mutex> slk(g_stillMutex);
-            g_latestStill.assign(pBuf, pBuf + len);
+            g_latestStill.assign(pBuf, pBuf + frameLen);
             g_stillWidth.store(haveDims ? sw : 0);
             g_stillHeight.store(haveDims ? sh : 0);
             g_stillSeq.fetch_add(1);
@@ -549,9 +601,9 @@ public:
         g_gapTraceRemaining.store(GAP_TRACE_FRAMES);
         g_stillCV.notify_all();
         if (haveDims) {
-            log_ts("  still trigger -> /still %ld bytes %dx%d, sending F9", len, sw, sh);
+            log_ts("  still trigger -> /still %zu bytes %dx%d, sending F9", frameLen, sw, sh);
         } else {
-            log_ts("  still trigger -> /still %ld bytes (SOF unreadable), sending F9", len);
+            log_ts("  still trigger -> /still %zu bytes (SOF unreadable), sending F9", frameLen);
         }
         // F9 is sent LAST and only on success. The browser learns a capture
         // happened solely because we tell it, so emitting the keystroke after the
@@ -955,7 +1007,15 @@ static void handle_client(SOCKET sock) {
             "Pragma: no-cache\r\n"
             "Access-Control-Allow-Origin: *\r\n"
             "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
-        send_all(sock, hdr, (int)strlen(hdr));
+        // A peer that vanished during the handshake must not fall through into
+        // the streaming loop: it would count as a viewer in /health and burn a
+        // 2 s CV timeout before its first failed frame send got it out.
+        if (!send_all(sock, hdr, (int)strlen(hdr))) {
+            log_ts("Preview client disconnected while sending headers "
+                   "(WSA error %d, %d preview client(s) active).",
+                   WSAGetLastError(), g_previewClients.load());
+            return;
+        }
 
         // RAII counter for /health preview_clients. Increments on entry, and
         // decrements on every exit path from the streaming loop below (return,
@@ -966,17 +1026,23 @@ static void handle_client(SOCKET sock) {
             ~PreviewClientGuard() { g_previewClients.fetch_sub(1); }
         } previewClientGuard;
 
+        // The Start this stream belongs to. See g_serverGeneration.
+        const unsigned long long generation = g_serverGeneration.load();
+        auto sessionLive = [&]{
+            return g_serverRunning && g_serverGeneration.load() == generation;
+        };
+
         // Start from the CURRENT sequence number, not -1: with -1 a client that
         // connects before the first frame arrives would immediately pass the
         // predicate and emit an empty Content-Length: 0 part.
         long long lastSeq = g_previewSeq.load();
-        while (g_serverRunning) {
+        while (sessionLive()) {
             std::vector<BYTE> frame;
             {
                 std::unique_lock<std::mutex> lk(g_previewMutex);
                 g_previewCV.wait_for(lk, std::chrono::seconds(2),
-                                    [&]{ return g_previewSeq.load() != lastSeq || !g_serverRunning; });
-                if (!g_serverRunning) break;
+                                    [&]{ return g_previewSeq.load() != lastSeq || !sessionLive(); });
+                if (!sessionLive()) break;
                 if (g_previewSeq.load() == lastSeq) continue;
                 frame = g_latestPreview;
                 lastSeq = g_previewSeq.load();
@@ -990,9 +1056,16 @@ static void handle_client(SOCKET sock) {
             int plen = snprintf(part, sizeof(part),
                 "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n",
                 frame.size());
-            if (!send_all(sock, part, plen)) break;
-            if (!send_all(sock, (const char*)frame.data(), (int)frame.size())) break;
-            if (!send_all(sock, "\r\n", 2)) break;
+            if (!send_all(sock, part, plen) ||
+                !send_all(sock, (const char*)frame.data(), (int)frame.size()) ||
+                !send_all(sock, "\r\n", 2)) {
+                // Normal for a closed tab; the WSA error and the surviving
+                // viewer count are what distinguish that from a link problem.
+                log_ts("Preview client disconnected while sending frame %lld "
+                       "(WSA error %d, %d preview client(s) active).",
+                       lastSeq, WSAGetLastError(), g_previewClients.load() - 1);
+                break;
+            }
         }
         return;
     }
@@ -1154,6 +1227,11 @@ static void handle_client(SOCKET sock) {
         body += ",\"configured_height\":" + std::to_string(g_configuredHeight.load());
         body += ",\"still_pin_width\":" + std::to_string(g_stillPinWidth.load());
         body += ",\"still_pin_height\":" + std::to_string(g_stillPinHeight.load());
+        // Nonzero means presses are being dropped on purpose. Without this the
+        // rejection is invisible to a client: still_seq simply stops advancing.
+        body += ",\"still_frames_rejected\":" + std::to_string(g_stillFramesRejected.load());
+        body += ",\"still_last_delivered_width\":" + std::to_string(g_stillLastDeliveredWidth.load());
+        body += ",\"still_last_delivered_height\":" + std::to_string(g_stillLastDeliveredHeight.load());
         body += ",\"still_seq\":" + std::to_string(g_stillSeq.load());
         body += std::string(",\"still_available\":") + (stillAvailable ? "true" : "false");
         // Read from the still's own SOF header, so this reports what the device
@@ -1171,8 +1249,9 @@ static void handle_client(SOCKET sock) {
             body += ",\"still_last_ms_ago\":" +
                     std::to_string(lastStill ? (steady_now_ms() - lastStill) : -1);
         }
-        // Changes on every helper start. A client holding a still_seq across a
-        // restart must drop it when this changes, or ?after= waits forever.
+        // Changes on every Start, including a tray Stop/Start that leaves the
+        // process alive. A client holding a still_seq must drop it when this
+        // changes, or ?after= waits forever on a counter that reset to 0.
         body += ",\"run_id\":" + std::to_string(g_runId);
         body += ",\"port\":" + std::to_string(g_port);
         body += ",\"uptime_s\":" + std::to_string(uptimeS) + "}";
@@ -1311,7 +1390,10 @@ static bool http_server_start(int port) {
         return false;
     }
     g_listenSock = srv;
+    g_serverGeneration.fetch_add(1);
     g_serverRunning = true;
+    g_runId = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
     g_sessionStartMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
     g_acceptThread = new std::thread(accept_loop, srv);
@@ -1488,6 +1570,24 @@ static void stop_capture() {
     g_captureFrameInterval100ns.store(0);
     g_stillSeq.store(0);
     g_sessionStartMs.store(0);
+    g_stillPinWidth.store(0);
+    g_stillPinHeight.store(0);
+    g_stillFramesRejected.store(0);
+    g_stillLastDeliveredWidth.store(0);
+    g_stillLastDeliveredHeight.store(0);
+    // Everything /health derives from the still that g_latestStill.clear()
+    // just discarded. Left alone, a session with still_available=false would
+    // still report the previous session's still_width/height.
+    g_stillWidth.store(0);
+    g_stillHeight.store(0);
+    g_lastStillMs.store(0);
+    g_maxGapSinceStillMs.store(0);
+    g_gapTraceRemaining.store(0);
+    // The inter-frame clock. Carried across a Stop, the first frame of the
+    // next session measures its gap against the last frame of the previous
+    // one -- the whole downtime -- and preview_max_gap_ms_since_still then
+    // reports that (observed: a five-day number after a device reconnect).
+    g_lastPreviewMs.store(0);
 
     g_state.store(HelperState::Stopped);
     if (hadSomething && stoppedClean) log_ts("Capture stopped; camera released.");
@@ -1525,8 +1625,8 @@ static HelperState start_capture() {
     g_cap.pBuilder->SetFiltergraph(g_cap.pGraph);
     g_cap.pGraph->AddFilter(g_cap.pSrc, L"Source");
 
-    // Capture pin at 1600x1200 MJPG: live preview + source of /still snapshot.
-    // Still pin at 320x240 MJPG: hardware-button trigger only; bytes discarded.
+    // Capture pin: live /preview and /snapshot, at the configured preview mode.
+    // Still pin: the bytes /still serves, at the sensor's full resolution.
     configure_format(g_cap.pSrc, g_cap.pBuilder, &PIN_CATEGORY_CAPTURE,
                      g_configuredWidth.load(), g_configuredHeight.load());
     log_compression_caps(g_cap.pSrc, g_cap.pBuilder, &PIN_CATEGORY_CAPTURE);
@@ -2076,9 +2176,6 @@ int main(int argc, char **argv) {
     bool consoleMode = false;
     bool badDebounce = false;     // logged once the log destination is known
     int positional = 0;
-
-    g_runId = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
 
     // File first, then flags, so --preview wins over helper-config.txt. No
     // validation against the camera's mode list here: configure_format already
