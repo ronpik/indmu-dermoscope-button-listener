@@ -1517,6 +1517,21 @@ static void stop_capture() {
     g_captureFrameInterval100ns.store(0);
     g_stillSeq.store(0);
     g_sessionStartMs.store(0);
+    g_stillPinWidth.store(0);
+    g_stillPinHeight.store(0);
+    // Everything /health derives from the still that g_latestStill.clear()
+    // just discarded. Left alone, a session with still_available=false would
+    // still report the previous session's still_width/height.
+    g_stillWidth.store(0);
+    g_stillHeight.store(0);
+    g_lastStillMs.store(0);
+    g_maxGapSinceStillMs.store(0);
+    g_gapTraceRemaining.store(0);
+    // The inter-frame clock. Carried across a Stop, the first frame of the
+    // next session measures its gap against the last frame of the previous
+    // one -- the whole downtime -- and preview_max_gap_ms_since_still then
+    // reports that (observed: a five-day number after a device reconnect).
+    g_lastPreviewMs.store(0);
 
     g_state.store(HelperState::Stopped);
     if (hadSomething && stoppedClean) log_ts("Capture stopped; camera released.");
