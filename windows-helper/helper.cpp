@@ -6,10 +6,16 @@
 //
 // Endpoints (default port 8080):
 //   GET /          -> minimal HTML test page (preview + capture + F9 handler)
-//   GET /preview   -> multipart/x-mixed-replace MJPEG stream (1600x1200 live)
-//   GET /still     -> image/jpeg of the most recent button-triggered still,
-//                     or 204 No Content if no still has been captured yet
-//                     this session
+//   GET /preview   -> multipart/x-mixed-replace MJPEG stream, Capture pin, at
+//                     the configured preview resolution (default 1024x768)
+//   GET /still     -> image/jpeg of the most recent button-triggered still, as
+//                     delivered by the camera's Still pin at 1600x1200, or 204
+//                     if nothing has been captured yet this session. Carries
+//                     X-Still-Seq. With ?after=<seq> it blocks up to 8 s until
+//                     a still newer than <seq> exists, then 204s.
+//   GET /snapshot  -> image/jpeg of the latest preview frame, for an on-screen
+//                     capture button. Capture-pin resolution, so lower-res than
+//                     /still; needs no button press and never blocks.
 //   GET /health    -> application/json helper status, for a web app to
 //                     detect that the helper is running (see it below)
 //   OPTIONS <path> -> 204 with CORS headers, for any of the paths above
@@ -19,8 +25,16 @@
 //     is stopped or not running -- that is the "not connected" signal, not
 //     a 404/204 from /still
 //   - <img src="http://localhost:8080/preview"> for live video
-//   - listen for F9 keydown; on receipt, fetch('/still') for the full-res
-//     JPEG (treat 204 as "no still yet", not an error)
+//   - listen for F9 keydown; on receipt, fetch('/still?after=<last seq>') for
+//     the full-res JPEG (treat 204 as "the capture did not happen", not an
+//     error). The helper synthesises that F9 itself, at the end of the Still
+//     pin's callback and only once the bytes are stored, so /still cannot
+//     still be holding the previous image when the fetch arrives.
+//   - track run_id from /health: it changes on every helper start, and a
+//     still_seq held across a restart must be dropped when it does, or
+//     ?after= waits against a counter that has reset to 0
+//   - route an on-screen capture button to /snapshot, not /still: /still only
+//     ever changes on a physical button press
 //
 // Run modes:
 //   helper.exe [port] [debounce_ms]
@@ -74,6 +88,7 @@
 #include <condition_variable>
 #include <vector>
 #include <set>
+#include <deque>
 #include <atomic>
 #include <chrono>
 
@@ -94,6 +109,76 @@ static DWORD g_debounce_ms = 300;
 // Configured TCP port (positional arg 1). Also used by the tray "Open test
 // page" command, which must open the real port and not a hard-coded 8080.
 static int g_port = 8080;
+
+// Preview capture resolution. Lowered only to fit a Wi-Fi link, so it is a
+// deployment setting rather than a constant: a cabled clinic raises it back to
+// the sensor's full 1600x1200 and gets the same ~6.8 fps, because the helper is
+// never the bottleneck. helper-config.txt next to the exe sets it; --preview=WxH
+// overrides that. Read once at startup -- changing it rebuilds the DirectShow
+// graph, so it cannot be reloaded per request.
+static std::atomic<int> g_configuredWidth{1024};
+static std::atomic<int> g_configuredHeight{768};
+
+// Still-pin resolution, configurable for the same reason plus one more: raising
+// it is what makes /still a real device capture, but the device's firmware
+// cooldown grows with it and at some resolution the button may stop being
+// usable. Being able to walk it down from a config file means that boundary can
+// be found without a rebuild per step.
+static std::atomic<int> g_stillConfWidth{1600};
+static std::atomic<int> g_stillConfHeight{1200};
+// What the Still pin actually negotiated, which can differ from the above.
+static std::atomic<int> g_stillPinWidth{0};
+static std::atomic<int> g_stillPinHeight{0};
+
+// Identifies this run of the helper. An app holding a still_seq across a helper
+// restart would otherwise long-poll ?after=<old seq> forever against a counter
+// that has reset to 0; a changed run_id tells it to drop the stored value.
+static long long g_runId = 0;
+
+// Builds a path to a file sitting next to the exe.
+static bool exe_dir_path(const wchar_t *leaf, wchar_t *out, size_t outLen) {
+    wchar_t dir[MAX_PATH] = {0};
+    DWORD n = GetModuleFileNameW(NULL, dir, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return false;
+    wchar_t *slash = wcsrchr(dir, L'\\');
+    if (!slash) return false;
+    slash[1] = 0;
+    if (wcslen(dir) + wcslen(leaf) + 1 > outLen) return false;
+    wcscpy(out, dir);
+    wcscat(out, leaf);
+    return true;
+}
+
+// helper-config.txt, one "key = value" per line, '#' comments. Absent file and
+// unparseable lines both leave the defaults in place: a clinic that has never
+// heard of this file must keep working.
+static void load_preview_config() {
+    wchar_t path[MAX_PATH];
+    if (!exe_dir_path(L"helper-config.txt", path, MAX_PATH)) return;
+    FILE *fp = _wfopen(path, L"rb");
+    if (!fp) return;
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        const char *s = line;
+        while (*s == ' ' || *s == '\t') ++s;
+        if (*s == '#' || *s == ';') continue;
+        bool isPreview = strncmp(s, "preview_resolution", 18) == 0;
+        bool isStill   = strncmp(s, "still_resolution", 16) == 0;
+        if (!isPreview && !isStill) continue;
+        const char *eq = strchr(s, '=');
+        int w = 0, h = 0;
+        if (eq && sscanf(eq + 1, " %d %*[xX] %d", &w, &h) == 2 && w > 0 && h > 0) {
+            if (isPreview) {
+                g_configuredWidth.store(w);
+                g_configuredHeight.store(h);
+            } else {
+                g_stillConfWidth.store(w);
+                g_stillConfHeight.store(h);
+            }
+        }
+    }
+    fclose(fp);
+}
 
 // ---- Tray / window constants ----
 #define TRAY_WND_CLASS   L"DermoscopeHelperTrayWnd"
@@ -153,9 +238,68 @@ static std::condition_variable g_previewCV;
 static std::vector<BYTE> g_latestPreview;
 static std::atomic<long long> g_previewSeq{0};
 
+static long long steady_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 static std::mutex g_stillMutex;
 static std::vector<BYTE> g_latestStill;
 static std::atomic<long long> g_stillSeq{0};
+// Woken when a new still lands, so GET /still?after=<seq> can long-poll instead
+// of the caller polling /health in a loop.
+static std::condition_variable g_stillCV;
+// Dimensions parsed out of the still's own JPEG SOF0, not assumed from the pin
+// format: the point of serving Still-pin bytes is that we stop guessing what
+// the device actually produced.
+static std::atomic<int> g_stillWidth{0};
+static std::atomic<int> g_stillHeight{0};
+
+// Preview-stall instrumentation for the Still-pin cooldown measurement. The
+// device's firmware pauses the capture pin for some time after emitting a
+// still; the clinician sees that as a frozen preview, so the UI needs the real
+// number rather than an estimate. g_maxGapSinceStillMs is reset when a still
+// lands and then tracks the largest inter-frame gap that follows it.
+static std::atomic<long long> g_lastStillMs{0};
+static std::atomic<long long> g_lastPreviewMs{0};
+static std::atomic<long long> g_maxGapSinceStillMs{0};
+
+// A single max-gap number answers "how long was the freeze" but not "how long
+// until it is smooth again", and a press requires a human, so one press has to
+// yield both. After a still, the next GAP_TRACE_FRAMES preview frames log their
+// own inter-frame gap: the first is the stall, and the point where the gaps
+// settle back to the nominal ~147 ms is the recovery time.
+static const int GAP_TRACE_FRAMES = 40;
+static std::atomic<int> g_gapTraceRemaining{0};
+
+// Reads width/height out of a JPEG's SOF header. Walks the marker chain rather
+// than searching for FF C0, because those two bytes occur often inside entropy-
+// coded data and a naive search finds garbage. Returns false on anything it does
+// not understand, so a malformed still reports no dimensions instead of wrong
+// ones.
+static bool jpeg_dimensions(const BYTE *p, size_t n, int *w, int *h) {
+    if (!p || n < 4 || p[0] != 0xFF || p[1] != 0xD8) return false;
+    size_t i = 2;
+    while (i + 3 < n) {
+        if (p[i] != 0xFF) return false;          // not at a marker: chain is broken
+        BYTE m = p[i + 1];
+        if (m == 0xFF) { ++i; continue; }        // fill byte, skip
+        if (m == 0xD8 || (m >= 0xD0 && m <= 0xD7) || m == 0x01) { i += 2; continue; }
+        if (m == 0xD9 || m == 0xDA) return false; // EOI / start of scan: no SOF found
+        size_t seglen = ((size_t)p[i + 2] << 8) | p[i + 3];
+        if (seglen < 2) return false;
+        // SOF0/1/2/3/5/6/7/9/10/11/13/14/15 carry the frame header; C4 (DHT),
+        // C8 (JPG) and CC (DAC) share the Cx range but are not frame headers.
+        if (m >= 0xC0 && m <= 0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC) {
+            if (i + 8 >= n) return false;
+            *h = ((int)p[i + 5] << 8) | p[i + 6];
+            *w = ((int)p[i + 7] << 8) | p[i + 8];
+            return (*w > 0 && *h > 0);
+        }
+        i += 2 + seglen;
+    }
+    return false;
+}
 
 // DirectShow friendly name of the attached camera, for GET /health. Written
 // once (UI thread, inside find_dermoscope()) per start_capture() call; read
@@ -171,6 +315,69 @@ static std::atomic<long long> g_sessionStartMs{0};
 // that Stop -> Start cycles work: stop_capture() clears it, start_capture()
 // sets it again.
 static std::atomic<bool> g_serverRunning{false};
+
+// ---- /health instrumentation (read-only for HTTP handlers) ----
+// configure_format() records the winning Capture-pin MJPG mode here so the
+// yardstick for every preview-perf experiment is visible in /health without
+// re-reading the driver.
+static std::atomic<int> g_captureWidth{0};
+static std::atomic<int> g_captureHeight{0};
+static std::atomic<long long> g_captureFrameInterval100ns{0};
+
+// BufferCB frame accounting, split by reason so the numbers stay diagnostic:
+// lumping deliberate decimation in with genuine bad frames would bury a
+// handful of real rejections under ~half the input stream.
+//   in            -- every buffer the driver hands us
+//   skipped       -- dropped by FRAME_SKIP decimation (expected, not a fault)
+//   dropped_busy  -- try_lock miss; a publisher/consumer contention signal
+//   rejected      -- malformed buffer, and publish-time quality filters
+// in == frames + skipped + dropped_busy + rejected.
+static std::atomic<long long> g_previewFramesIn{0};
+static std::atomic<long long> g_previewFramesSkipped{0};
+static std::atomic<long long> g_previewFramesDroppedBusy{0};
+static std::atomic<long long> g_previewFramesRejected{0};
+
+// Number of live /preview streaming loops. Maintained by an RAII guard around
+// the streaming loop in serve_client() (see /preview below).
+static std::atomic<int> g_previewClients{0};
+
+// Rolling published-fps meter (last <=64 publish timestamps within a 10 s
+// window). note() runs on the DirectShow callback thread; rate_hz() runs on
+// HTTP threads. Its own mutex, so /health readers never contend g_previewMutex.
+class PreviewFpsMeter {
+    std::mutex mu_;
+    std::deque<long long> ts_ms_;
+    static constexpr size_t MAX_SAMPLES = 64;
+    static constexpr long long WINDOW_MS = 10000;
+    static long long now_ms() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+public:
+    void note() {
+        long long n = now_ms();
+        std::lock_guard<std::mutex> lk(mu_);
+        ts_ms_.push_back(n);
+        while (ts_ms_.size() > MAX_SAMPLES) ts_ms_.pop_front();
+        while (!ts_ms_.empty() && n - ts_ms_.front() > WINDOW_MS) ts_ms_.pop_front();
+    }
+    double rate_hz() {
+        long long n = now_ms();
+        std::lock_guard<std::mutex> lk(mu_);
+        while (!ts_ms_.empty() && n - ts_ms_.front() > WINDOW_MS) ts_ms_.pop_front();
+        if (ts_ms_.size() < 2) return 0.0;
+        double span_s = (double)(ts_ms_.back() - ts_ms_.front()) / 1000.0;
+        if (span_s <= 0.0) return 0.0;
+        return (double)(ts_ms_.size() - 1) / span_s;
+    }
+    void reset() { std::lock_guard<std::mutex> lk(mu_); ts_ms_.clear(); }
+};
+static PreviewFpsMeter g_previewFps;
+// Measured at the top of BufferCB, before any filtering. The driver's
+// advertised AvgTimePerFrame is not what this camera actually delivers
+// (it claims 15 fps at 1600x1200 and delivers ~6.9), so this is the
+// yardstick for any capture-mode change -- never the advertised figure.
+static PreviewFpsMeter g_previewInputFps;
 
 enum class HelperState { Stopped, Running, DeviceNotFound, CameraBusy, Error };
 static std::atomic<HelperState> g_state{HelperState::Stopped};
@@ -242,7 +449,7 @@ class PreviewCB : public ISampleGrabberCB_local {
 public:
     LONG ref = 1;
     LONG frame_count = 0;
-    static const LONG FRAME_SKIP = 2;
+    static const LONG FRAME_SKIP = 1;
     virtual ~PreviewCB() {}   // we delete these by concrete type in stop_capture()
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override {
         if (!ppv) return E_POINTER;
@@ -255,14 +462,37 @@ public:
     ULONG STDMETHODCALLTYPE Release() override { return InterlockedDecrement(&ref); }
     HRESULT STDMETHODCALLTYPE SampleCB(double, IMediaSample*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE BufferCB(double, BYTE *pBuf, long len) override {
-        if (len <= 0 || !pBuf) return S_OK;
-        if ((InterlockedIncrement(&frame_count) % FRAME_SKIP) != 0) return S_OK;
+        g_previewFramesIn.fetch_add(1);
+        g_previewInputFps.note();
+        {
+            long long now = steady_now_ms();
+            long long prev = g_lastPreviewMs.exchange(now);
+            if (prev != 0) {
+                long long gap = now - prev;
+                long long best = g_maxGapSinceStillMs.load();
+                while (gap > best &&
+                       !g_maxGapSinceStillMs.compare_exchange_weak(best, gap)) {}
+                int left = g_gapTraceRemaining.load();
+                while (left > 0 &&
+                       !g_gapTraceRemaining.compare_exchange_weak(left, left - 1)) {}
+                if (left > 0) {
+                    log_ts("  post-still preview frame %d: gap %lld ms, t+%lld ms",
+                           GAP_TRACE_FRAMES - left + 1, gap, now - g_lastStillMs.load());
+                }
+            }
+        }
+        if (len <= 0 || !pBuf) { g_previewFramesRejected.fetch_add(1); return S_OK; }
+        if ((InterlockedIncrement(&frame_count) % FRAME_SKIP) != 0) {
+            g_previewFramesSkipped.fetch_add(1); return S_OK;
+        }
         std::unique_lock<std::mutex> lk(g_previewMutex, std::try_to_lock);
-        if (!lk.owns_lock()) return S_OK;
+        if (!lk.owns_lock()) { g_previewFramesDroppedBusy.fetch_add(1); return S_OK; }
         if (g_latestPreview.size() != (size_t)len) g_latestPreview.resize((size_t)len);
         memcpy(g_latestPreview.data(), pBuf, (size_t)len);
         g_previewSeq.fetch_add(1);
         g_previewCV.notify_all();
+        lk.unlock();
+        g_previewFps.note();
         return S_OK;
     }
 };
@@ -285,7 +515,6 @@ public:
     ULONG STDMETHODCALLTYPE Release() override { return InterlockedDecrement(&ref); }
     HRESULT STDMETHODCALLTYPE SampleCB(double, IMediaSample*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE BufferCB(double, BYTE *pBuf, long len) override {
-        (void)pBuf;  // Still-pin bytes are discarded; we snapshot the preview.
         DWORD now = GetTickCount();
         {
             std::lock_guard<std::mutex> lk(tick_mu);
@@ -296,22 +525,39 @@ public:
             }
             last_press_tick = now;
         }
-        // Snapshot the latest high-res preview frame into /still.
-        std::vector<BYTE> snapshot;
+        // These bytes ARE the device's still. Serving them is the whole point:
+        // a preview snapshot would just be a frozen preview frame, not what the
+        // camera produces when its button is pressed.
+        if (len <= 0 || !pBuf || pBuf[0] != 0xFF || pBuf[1] != 0xD8) {
+            log_ts("  still trigger -> device delivered %ld unusable bytes; "
+                   "/still unchanged, NO F9 sent", len);
+            return S_OK;
+        }
+        int sw = 0, sh = 0;
+        bool haveDims = jpeg_dimensions(pBuf, (size_t)len, &sw, &sh);
         {
-            std::lock_guard<std::mutex> plk(g_previewMutex);
-            snapshot = g_latestPreview;
-        }
-        if (!snapshot.empty()) {
-            size_t sz = snapshot.size();
             std::lock_guard<std::mutex> slk(g_stillMutex);
-            g_latestStill = std::move(snapshot);
+            g_latestStill.assign(pBuf, pBuf + len);
+            g_stillWidth.store(haveDims ? sw : 0);
+            g_stillHeight.store(haveDims ? sh : 0);
             g_stillSeq.fetch_add(1);
-            log_ts("  still trigger -> /still %zu bytes, sending F9", sz);
-        } else {
-            log_ts("  still trigger -> preview not ready; /still unchanged, sending F9");
         }
-        // Send a single F9 keystroke.
+        // Reset the stall window here, so preview_max_gap_ms_since_still measures
+        // this capture's cooldown and not the previous one's.
+        g_lastStillMs.store(steady_now_ms());
+        g_maxGapSinceStillMs.store(0);
+        g_gapTraceRemaining.store(GAP_TRACE_FRAMES);
+        g_stillCV.notify_all();
+        if (haveDims) {
+            log_ts("  still trigger -> /still %ld bytes %dx%d, sending F9", len, sw, sh);
+        } else {
+            log_ts("  still trigger -> /still %ld bytes (SOF unreadable), sending F9", len);
+        }
+        // F9 is sent LAST and only on success. The browser learns a capture
+        // happened solely because we tell it, so emitting the keystroke after the
+        // bytes are stored means /still can never serve the previous image to the
+        // fetch this keystroke triggers. Sending F9 on a failed capture would
+        // cause exactly that: a silent stale save.
         INPUT inp[2] = {0};
         inp[0].type = INPUT_KEYBOARD;
         inp[0].ki.wVk = VK_F9;
@@ -438,6 +684,8 @@ static void configure_format(IBaseFilter *pSrc, ICaptureGraphBuilder2 *pBuilder,
                 VIDEOINFOHEADER *vih = (VIDEOINFOHEADER*)mt->pbFormat;
                 int w = vih->bmiHeader.biWidth;
                 int h = vih->bmiHeader.biHeight;
+                log_ts("  candidate MJPG %dx%d (AvgTimePerFrame=%lld 100ns)",
+                       w, h, (long long)vih->AvgTimePerFrame);
                 bool better = (!bestMT) ||
                     (w >= wantW && h >= wantH && (bestW < wantW || bestH < wantH || w*h < bestW*bestH)) ||
                     (bestW < wantW && bestH < wantH && w*h > bestW*bestH);
@@ -452,11 +700,61 @@ static void configure_format(IBaseFilter *pSrc, ICaptureGraphBuilder2 *pBuilder,
     }
     free(caps);
     if (bestMT) {
-        log_ts("Setting format MJPG %dx%d on pin", bestW, bestH);
+        long long avgTimePerFrame = 0;
+        if (bestMT->formattype == FORMAT_VideoInfo && bestMT->pbFormat) {
+            avgTimePerFrame = (long long)((VIDEOINFOHEADER*)bestMT->pbFormat)->AvgTimePerFrame;
+        }
+        log_ts("Setting format MJPG %dx%d on pin (AvgTimePerFrame=%lld 100ns)",
+               bestW, bestH, avgTimePerFrame);
         pCfg->SetFormat(bestMT);
+        // Record the winning Capture-pin mode for /health. The Still pin runs a
+        // separate small resolution used only as a trigger; ignore it here so
+        // /health always reports the pin whose bytes actually reach /preview.
+        if (IsEqualGUID(*pinCategory, PIN_CATEGORY_CAPTURE)) {
+            g_captureWidth.store(bestW);
+            g_captureHeight.store(bestH);
+            g_captureFrameInterval100ns.store(avgTimePerFrame);
+        } else if (IsEqualGUID(*pinCategory, PIN_CATEGORY_STILL)) {
+            g_stillPinWidth.store(bestW);
+            g_stillPinHeight.store(bestH);
+        }
         free_mt(bestMT);
     }
     pCfg->Release();
+}
+
+// Diagnostic: does this driver expose a JPEG quality/compression knob? If it does,
+// preview payload could shrink without lowering resolution or transcoding. Most UVC
+// drivers do not implement IAMVideoCompression at all; log either way so the answer
+// is on record instead of assumed.
+static void log_compression_caps(IBaseFilter *pSrc, ICaptureGraphBuilder2 *pBuilder,
+                                 const GUID *pinCategory) {
+    if (!pSrc || !pBuilder) return;
+    IAMVideoCompression *pComp = NULL;
+    HRESULT hr = pBuilder->FindInterface(pinCategory, &MEDIATYPE_Video, pSrc,
+                                         IID_IAMVideoCompression, (void**)&pComp);
+    if (FAILED(hr) || !pComp) {
+        log_ts("compression: IAMVideoCompression not exposed (0x%08lX) "
+               "- no driver-side quality knob", (unsigned long)hr);
+        return;
+    }
+    WCHAR ver[128] = {0}, desc[128] = {0};
+    int cbVer = sizeof(ver), cbDesc = sizeof(desc);
+    long defKeyRate = 0, defPPerKey = 0, caps = 0;
+    double defQuality = 0.0;
+    HRESULT ghr = pComp->GetInfo(ver, &cbVer, desc, &cbDesc,
+                                 &defKeyRate, &defPPerKey, &defQuality, &caps);
+    if (SUCCEEDED(ghr)) {
+        log_ts("compression: desc='%ls' caps=0x%lX defaultQuality=%.3f CanQuality=%s",
+               desc, (unsigned long)caps, defQuality,
+               (caps & CompressionCaps_CanQuality) ? "YES" : "no");
+    } else {
+        log_ts("compression: IAMVideoCompression present but GetInfo failed (0x%08lX)",
+               (unsigned long)ghr);
+    }
+    double q = 0.0;
+    if (SUCCEEDED(pComp->get_Quality(&q))) log_ts("compression: current quality=%.3f", q);
+    pComp->Release();
 }
 
 // ---- HTTP server ----
@@ -562,6 +860,45 @@ static bool send_all(SOCKET s, const char *buf, int len) {
     return true;
 }
 
+// Reads one integer parameter out of a raw query string ("a=1&after=42").
+// Returns false if the key is absent, so callers can distinguish "not asked
+// for" from "asked for with value 0".
+static bool query_get_ll(const char *query, const char *key, long long *out) {
+    if (!query || !key || !out) return false;
+    size_t klen = strlen(key);
+    for (const char *p = query; p && *p; ) {
+        const char *amp = strchr(p, '&');
+        size_t seglen = amp ? (size_t)(amp - p) : strlen(p);
+        if (seglen > klen && strncmp(p, key, klen) == 0 && p[klen] == '=') {
+            *out = _strtoi64(p + klen + 1, NULL, 10);
+            return true;
+        }
+        if (!amp) break;
+        p = amp + 1;
+    }
+    return false;
+}
+
+// Cap for the GET /still?after= long-poll.
+static const int STILL_WAIT_S = 8;
+
+// True once the peer has closed its end. A closed socket selects as readable
+// and then peeks zero bytes; a socket with a real pending request peeks >0 and
+// an idle one does not select readable at all. Used to drop a blocked long-poll
+// as soon as the app cancels it (Retake, dialog close) instead of holding the
+// thread for the full 8 s.
+static bool peer_closed(SOCKET s) {
+    fd_set rd;
+    FD_ZERO(&rd);
+    FD_SET(s, &rd);
+    timeval tv = {0, 0};
+    if (select(0, &rd, NULL, NULL, &tv) <= 0) return false;
+    char c;
+    int n = recv(s, &c, 1, MSG_PEEK);
+    if (n == 0) return true;
+    return n < 0 && WSAGetLastError() != WSAEWOULDBLOCK;
+}
+
 // Handles one request. Never closes the socket -- serve_client() owns that so
 // the close is serialised with the shutdown path's closesocket().
 static void handle_client(SOCKET sock) {
@@ -573,16 +910,16 @@ static void handle_client(SOCKET sock) {
     char method[16] = {0}, path[256] = {0};
     sscanf(buf, "%15s %255s", method, path);
 
-    // Strip a query string before routing: none of our endpoints take
-    // parameters, and callers commonly append one anyway as a cache-buster
-    // (e.g. "/preview?t=123" to force a browser to re-open the stream).
-    // Without this every such request 404s.
+    // Split the query string off before routing rather than discarding it.
+    // Most endpoints ignore it -- callers commonly append a cache-buster like
+    // "/preview?t=123" and without this every such request 404s -- but /still
+    // reads ?after= out of it.
     char *query = strchr(path, '?');
-    if (query) *query = '\0';
+    if (query) { *query = '\0'; ++query; }
 
     bool knownPath = strcmp(path, "/") == 0 || strcmp(path, "/index.html") == 0 ||
                      strcmp(path, "/preview") == 0 || strcmp(path, "/still") == 0 ||
-                     strcmp(path, "/health") == 0;
+                     strcmp(path, "/snapshot") == 0 || strcmp(path, "/health") == 0;
 
     // CORS preflight. Handled before routing by path so a preflight never
     // falls into e.g. /preview's streaming loop or /still's image body.
@@ -620,6 +957,15 @@ static void handle_client(SOCKET sock) {
             "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
         send_all(sock, hdr, (int)strlen(hdr));
 
+        // RAII counter for /health preview_clients. Increments on entry, and
+        // decrements on every exit path from the streaming loop below (return,
+        // break, exception), so a browser closing a tab is reflected in the
+        // next /health poll without any explicit bookkeeping in the loop.
+        struct PreviewClientGuard {
+            PreviewClientGuard()  { g_previewClients.fetch_add(1); }
+            ~PreviewClientGuard() { g_previewClients.fetch_sub(1); }
+        } previewClientGuard;
+
         // Start from the CURRENT sequence number, not -1: with -1 a client that
         // connects before the first frame arrives would immediately pass the
         // predicate and emit an empty Content-Length: 0 part.
@@ -652,16 +998,88 @@ static void handle_client(SOCKET sock) {
     }
 
     if (strcmp(path, "/still") == 0) {
+        long long after = 0;
+        bool waitForNew = query_get_ll(query, "after", &after);
         std::vector<BYTE> frame;
+        long long seq = 0;
         {
-            std::lock_guard<std::mutex> lk(g_stillMutex);
-            frame = g_latestStill;
+            std::unique_lock<std::mutex> lk(g_stillMutex);
+            if (waitForNew) {
+                // Long-poll until a still newer than `after` exists. This should
+                // return immediately every time: the helper synthesises the F9
+                // that provokes this fetch, and only after storing the bytes, so
+                // the new still is already in hand before the caller can ask. It
+                // is here for the cases that ordering does not cover -- a lost or
+                // duplicated keystroke, a second tab, a helper restart mid-session.
+                //
+                // Waited in slices so a cancelled request (Retake, dialog close)
+                // frees its thread promptly rather than after the full cap. Only
+                // this thread blocks: every other endpoint is served on its own
+                // thread and g_stillMutex is released while waiting.
+                long long deadline = steady_now_ms() + (long long)STILL_WAIT_S * 1000;
+                while (g_serverRunning && g_stillSeq.load() <= after) {
+                    long long remain = deadline - steady_now_ms();
+                    if (remain <= 0) break;
+                    if (remain > 250) remain = 250;
+                    g_stillCV.wait_for(lk, std::chrono::milliseconds(remain));
+                    if (g_stillSeq.load() > after) break;
+                    lk.unlock();
+                    bool gone = peer_closed(sock);
+                    lk.lock();
+                    if (gone) break;
+                }
+            }
+            seq = g_stillSeq.load();
+            if (!waitForNew || seq > after) frame = g_latestStill;
         }
         if (frame.empty()) {
             // 204, not 404: a web app polling /still needs "nothing captured
             // yet this session" to be distinguishable from "the helper isn't
             // running" (which now shows up as a refused connection, or via
-            // GET /health). See the endpoint list at the top of this file.
+            // GET /health). With ?after= it also means "no NEW still arrived
+            // within the wait" -- the capture did not happen.
+            char r[256];
+            int rlen = snprintf(r, sizeof(r),
+                "HTTP/1.0 204 No Content\r\n"
+                "Cache-Control: no-store\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Access-Control-Expose-Headers: X-Still-Seq\r\n"
+                "X-Still-Seq: %lld\r\n"
+                "Connection: close\r\n\r\n", seq);
+            send_all(sock, r, rlen);
+        } else {
+            // Access-Control-Expose-Headers is required or a cross-origin caller
+            // cannot read X-Still-Seq at all -- the browser hides every response
+            // header outside the CORS-safelisted set unless it is named here.
+            char hdr[320];
+            int hlen = snprintf(hdr, sizeof(hdr),
+                "HTTP/1.0 200 OK\r\n"
+                "Content-Type: image/jpeg\r\n"
+                "Cache-Control: no-store\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Access-Control-Expose-Headers: X-Still-Seq\r\n"
+                "X-Still-Seq: %lld\r\n"
+                "Content-Length: %zu\r\n"
+                "Connection: close\r\n\r\n",
+                seq, frame.size());
+            send_all(sock, hdr, hlen);
+            send_all(sock, (const char*)frame.data(), (int)frame.size());
+        }
+        return;
+    }
+
+    // The latest preview frame, for the app's on-screen Capture button. /still
+    // cannot serve that any more: it now returns device stills, which only exist
+    // after a physical button press. This is capture-pin resolution, so it is
+    // deliberately lower-res than /still -- the device only produces full-res
+    // frames on a real press, and no software path can conjure one.
+    if (strcmp(path, "/snapshot") == 0) {
+        std::vector<BYTE> frame;
+        {
+            std::lock_guard<std::mutex> lk(g_previewMutex);
+            frame = g_latestPreview;
+        }
+        if (frame.size() < 2 || frame[0] != 0xFF || frame[1] != 0xD8) {
             const char *r = "HTTP/1.0 204 No Content\r\n"
                             "Cache-Control: no-store\r\n"
                             "Access-Control-Allow-Origin: *\r\n"
@@ -699,14 +1117,63 @@ static void handle_client(SOCKET sock) {
             std::chrono::steady_clock::now().time_since_epoch()).count();
         long long uptimeS = (startMs > 0 && nowMs > startMs) ? (nowMs - startMs) / 1000 : 0;
 
+        int capW = g_captureWidth.load();
+        int capH = g_captureHeight.load();
+        long long capInterval = g_captureFrameInterval100ns.load();
+        double capAdvertisedFps = (capInterval > 0) ? (1.0e7 / (double)capInterval) : 0.0;
+        double previewFps = g_previewFps.rate_hz();
+        double inputFps = g_previewInputFps.rate_hz();
+        char fpsBuf[32], advFpsBuf[32], inFpsBuf[32];
+        snprintf(fpsBuf,    sizeof(fpsBuf),    "%.2f", previewFps);
+        snprintf(advFpsBuf, sizeof(advFpsBuf), "%.2f", capAdvertisedFps);
+        snprintf(inFpsBuf,  sizeof(inFpsBuf),  "%.2f", inputFps);
+
         // status is always "running": the HTTP server -- and so /health --
         // only exists while capture is running (see the top of this file).
         std::string body;
         body += "{\"status\":\"running\",\"version\":\"" + json_escape(HELPER_VERSION) + "\"";
         body += ",\"device\":\"" + json_escape(device) + "\"";
+        body += ",\"capture_width\":" + std::to_string(capW);
+        body += ",\"capture_height\":" + std::to_string(capH);
+        body += ",\"capture_frame_interval_100ns\":" + std::to_string(capInterval);
+        // Advertised by the driver; this camera does NOT deliver it. Compare
+        // against preview_input_fps, which is measured.
+        body += ",\"capture_advertised_fps\":"; body += advFpsBuf;
+        body += ",\"preview_frames_in\":" + std::to_string(g_previewFramesIn.load());
+        body += ",\"preview_input_fps\":";  body += inFpsBuf;
         body += ",\"preview_frames\":" + std::to_string(g_previewSeq.load());
+        body += ",\"preview_fps\":";        body += fpsBuf;
+        body += ",\"preview_frames_skipped\":" + std::to_string(g_previewFramesSkipped.load());
+        body += ",\"preview_frames_dropped_busy\":" + std::to_string(g_previewFramesDroppedBusy.load());
+        body += ",\"preview_frames_rejected\":" + std::to_string(g_previewFramesRejected.load());
+        body += ",\"preview_clients\":" + std::to_string(g_previewClients.load());
+        // Configured vs negotiated: what was asked for, and what the driver
+        // actually granted. They differ whenever a config value names a mode the
+        // camera does not offer, which is otherwise silent.
+        body += ",\"configured_width\":" + std::to_string(g_configuredWidth.load());
+        body += ",\"configured_height\":" + std::to_string(g_configuredHeight.load());
+        body += ",\"still_pin_width\":" + std::to_string(g_stillPinWidth.load());
+        body += ",\"still_pin_height\":" + std::to_string(g_stillPinHeight.load());
         body += ",\"still_seq\":" + std::to_string(g_stillSeq.load());
         body += std::string(",\"still_available\":") + (stillAvailable ? "true" : "false");
+        // Read from the still's own SOF header, so this reports what the device
+        // produced rather than what the pin was asked for. 0 means no still yet
+        // or an unreadable header.
+        body += ",\"still_width\":" + std::to_string(g_stillWidth.load());
+        body += ",\"still_height\":" + std::to_string(g_stillHeight.load());
+        // Cooldown instrumentation: the largest preview inter-frame gap since the
+        // last still landed. This is the length of the freeze a clinician sees
+        // after pressing the button.
+        body += ",\"preview_max_gap_ms_since_still\":" +
+                std::to_string(g_maxGapSinceStillMs.load());
+        {
+            long long lastStill = g_lastStillMs.load();
+            body += ",\"still_last_ms_ago\":" +
+                    std::to_string(lastStill ? (steady_now_ms() - lastStill) : -1);
+        }
+        // Changes on every helper start. A client holding a still_seq across a
+        // restart must drop it when this changes, or ?after= waits forever.
+        body += ",\"run_id\":" + std::to_string(g_runId);
         body += ",\"port\":" + std::to_string(g_port);
         body += ",\"uptime_s\":" + std::to_string(uptimeS) + "}";
 
@@ -1010,6 +1477,15 @@ static void stop_capture() {
         g_deviceName.clear();
     }
     g_previewSeq.store(0);
+    g_previewFramesIn.store(0);
+    g_previewFramesSkipped.store(0);
+    g_previewFramesDroppedBusy.store(0);
+    g_previewFramesRejected.store(0);
+    g_previewFps.reset();
+    g_previewInputFps.reset();
+    g_captureWidth.store(0);
+    g_captureHeight.store(0);
+    g_captureFrameInterval100ns.store(0);
     g_stillSeq.store(0);
     g_sessionStartMs.store(0);
 
@@ -1051,8 +1527,16 @@ static HelperState start_capture() {
 
     // Capture pin at 1600x1200 MJPG: live preview + source of /still snapshot.
     // Still pin at 320x240 MJPG: hardware-button trigger only; bytes discarded.
-    configure_format(g_cap.pSrc, g_cap.pBuilder, &PIN_CATEGORY_CAPTURE, 9999, 9999);
-    configure_format(g_cap.pSrc, g_cap.pBuilder, &PIN_CATEGORY_STILL,    320,  240);
+    configure_format(g_cap.pSrc, g_cap.pBuilder, &PIN_CATEGORY_CAPTURE,
+                     g_configuredWidth.load(), g_configuredHeight.load());
+    log_compression_caps(g_cap.pSrc, g_cap.pBuilder, &PIN_CATEGORY_CAPTURE);
+    // The Still pin now supplies /still's actual bytes, so it runs at the
+    // sensor's full resolution. It was previously pinned at 320x240 to keep the
+    // device's post-capture firmware cooldown short enough for multi-click
+    // detection; multi-click was dropped in 9e0fef4, so that constraint is gone
+    // and a slower cooldown buys real device stills instead of preview frames.
+    configure_format(g_cap.pSrc, g_cap.pBuilder, &PIN_CATEGORY_STILL,
+                     g_stillConfWidth.load(), g_stillConfHeight.load());
 
     // Capture pin -> Preview SampleGrabber -> NullRenderer
     hr = CoCreateInstance(CLSID_SampleGrabber_local, NULL, CLSCTX_INPROC_SERVER,
@@ -1592,9 +2076,33 @@ int main(int argc, char **argv) {
     bool consoleMode = false;
     bool badDebounce = false;     // logged once the log destination is known
     int positional = 0;
+
+    g_runId = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    // File first, then flags, so --preview wins over helper-config.txt. No
+    // validation against the camera's mode list here: configure_format already
+    // falls back to the nearest mode the driver offers, and /health reports
+    // configured_* next to capture_* so any mismatch is visible rather than
+    // silent. A hardcoded list would just rot against a different camera.
+    load_preview_config();
     for (int i = 1; i < argc; ++i) {
         if (argv[i][0] == '-' && argv[i][1] == '-') {
             if (strcmp(argv[i], "--console") == 0) consoleMode = true;
+            if (strncmp(argv[i], "--preview=", 10) == 0) {
+                int w = 0, h = 0;
+                if (sscanf(argv[i] + 10, "%d %*[xX] %d", &w, &h) == 2 && w > 0 && h > 0) {
+                    g_configuredWidth.store(w);
+                    g_configuredHeight.store(h);
+                }
+            }
+            if (strncmp(argv[i], "--still=", 8) == 0) {
+                int w = 0, h = 0;
+                if (sscanf(argv[i] + 8, "%d %*[xX] %d", &w, &h) == 2 && w > 0 && h > 0) {
+                    g_stillConfWidth.store(w);
+                    g_stillConfHeight.store(h);
+                }
+            }
             continue;
         }
         if (positional == 0) {
