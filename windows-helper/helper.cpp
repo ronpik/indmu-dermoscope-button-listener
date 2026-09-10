@@ -133,9 +133,15 @@ static std::atomic<int> g_stillConfHeight{1200};
 static std::atomic<int> g_stillPinWidth{0};
 static std::atomic<int> g_stillPinHeight{0};
 
-// Identifies this run of the helper. An app holding a still_seq across a helper
-// restart would otherwise long-poll ?after=<old seq> forever against a counter
-// that has reset to 0; a changed run_id tells it to drop the stored value.
+// Identifies this capture session. An app holding a still_seq across a restart
+// would otherwise long-poll ?after=<old seq> forever against a counter that has
+// reset to 0; a changed run_id tells it to drop the stored value.
+//
+// Restamped per Start, not per process: tray Stop resets still_seq to 0 while
+// the process lives on, so a process-lifetime id would leave the counter running
+// backwards under an unchanged run_id -- exactly the case this field exists to
+// catch. Set in http_server_start(), the one point a client can begin observing
+// it, so it can never be seen out of step with the counter it guards.
 static long long g_runId = 0;
 
 // Builds a path to a file sitting next to the exe.
@@ -1213,8 +1219,9 @@ static void handle_client(SOCKET sock) {
             body += ",\"still_last_ms_ago\":" +
                     std::to_string(lastStill ? (steady_now_ms() - lastStill) : -1);
         }
-        // Changes on every helper start. A client holding a still_seq across a
-        // restart must drop it when this changes, or ?after= waits forever.
+        // Changes on every Start, including a tray Stop/Start that leaves the
+        // process alive. A client holding a still_seq must drop it when this
+        // changes, or ?after= waits forever on a counter that reset to 0.
         body += ",\"run_id\":" + std::to_string(g_runId);
         body += ",\"port\":" + std::to_string(g_port);
         body += ",\"uptime_s\":" + std::to_string(uptimeS) + "}";
@@ -1355,6 +1362,8 @@ static bool http_server_start(int port) {
     g_listenSock = srv;
     g_serverGeneration.fetch_add(1);
     g_serverRunning = true;
+    g_runId = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
     g_sessionStartMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
     g_acceptThread = new std::thread(accept_loop, srv);
@@ -2134,9 +2143,6 @@ int main(int argc, char **argv) {
     bool consoleMode = false;
     bool badDebounce = false;     // logged once the log destination is known
     int positional = 0;
-
-    g_runId = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
 
     // File first, then flags, so --preview wins over helper-config.txt. No
     // validation against the camera's mode list here: configure_format already
