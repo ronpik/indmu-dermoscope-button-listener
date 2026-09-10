@@ -55,12 +55,13 @@
 //
 // DirectShow graph:
 //   SourceFilter (HT-B30S)
-//     +-- Capture pin (MJPG 1600x1200) -> SampleGrabber (PreviewCB) -> NullRenderer
-//     |     -- feeds /preview (live) AND serves as the source of /still
-//     +-- Still pin   (MJPG 320x240)   -> SampleGrabber (StillCB)   -> NullRenderer
-//           -- used ONLY as the hardware-button trigger; bytes are discarded.
-//              On trigger, we snapshot the latest Capture-pin preview frame
-//              into the /still buffer so /still is always a 1600x1200 JPEG.
+//     +-- Capture pin (MJPG, configured preview mode) -> SampleGrabber (PreviewCB) -> NullRenderer
+//     |     -- feeds /preview (live stream) and /snapshot (latest frame).
+//     +-- Still pin   (MJPG, full sensor res)         -> SampleGrabber (StillCB)   -> NullRenderer
+//           -- delivers bytes ONLY on a hardware-button press. Those bytes ARE
+//              what /still serves: a real device still at the sensor's full
+//              resolution, never a frozen preview frame. Storing them is what
+//              then triggers the synthetic F9.
 //
 // Why single-click only: the device has a USB alt-setting threshold between
 // 320x240 and 640x480 on the Capture pin. Above 320x240 the bandwidth
@@ -91,6 +92,8 @@
 #include <deque>
 #include <atomic>
 #include <chrono>
+
+#include "mjpeg_frame.h"
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -489,13 +492,17 @@ public:
             }
         }
         if (len <= 0 || !pBuf) { g_previewFramesRejected.fetch_add(1); return S_OK; }
+        // Trim to the first complete JPEG frame; rejects spliced buffers where
+        // the driver has concatenated two frames without EOI on the first one.
+        size_t frameLen = mjpeg_first_frame_size(pBuf, (size_t)len);
+        if (frameLen == 0) { g_previewFramesRejected.fetch_add(1); return S_OK; }
         if ((InterlockedIncrement(&frame_count) % FRAME_SKIP) != 0) {
             g_previewFramesSkipped.fetch_add(1); return S_OK;
         }
         std::unique_lock<std::mutex> lk(g_previewMutex, std::try_to_lock);
         if (!lk.owns_lock()) { g_previewFramesDroppedBusy.fetch_add(1); return S_OK; }
-        if (g_latestPreview.size() != (size_t)len) g_latestPreview.resize((size_t)len);
-        memcpy(g_latestPreview.data(), pBuf, (size_t)len);
+        if (g_latestPreview.size() != frameLen) g_latestPreview.resize(frameLen);
+        memcpy(g_latestPreview.data(), pBuf, frameLen);
         g_previewSeq.fetch_add(1);
         g_previewCV.notify_all();
         lk.unlock();
@@ -535,16 +542,23 @@ public:
         // These bytes ARE the device's still. Serving them is the whole point:
         // a preview snapshot would just be a frozen preview frame, not what the
         // camera produces when its button is pressed.
-        if (len <= 0 || !pBuf || pBuf[0] != 0xFF || pBuf[1] != 0xD8) {
+        // len is signed; guard before the size_t cast so a negative length
+        // cannot turn into a huge one and walk off the end of the buffer.
+        size_t frameLen = (len > 0 && pBuf) ? mjpeg_first_frame_size(pBuf, (size_t)len) : 0;
+        if (frameLen == 0) {
             log_ts("  still trigger -> device delivered %ld unusable bytes; "
                    "/still unchanged, NO F9 sent", len);
             return S_OK;
         }
+        if ((long)frameLen != len) {
+            log_ts("  still trigger -> trimmed buffer %ld -> %zu bytes (spliced or padded)",
+                   len, frameLen);
+        }
         int sw = 0, sh = 0;
-        bool haveDims = jpeg_dimensions(pBuf, (size_t)len, &sw, &sh);
+        bool haveDims = jpeg_dimensions(pBuf, frameLen, &sw, &sh);
         {
             std::lock_guard<std::mutex> slk(g_stillMutex);
-            g_latestStill.assign(pBuf, pBuf + len);
+            g_latestStill.assign(pBuf, pBuf + frameLen);
             g_stillWidth.store(haveDims ? sw : 0);
             g_stillHeight.store(haveDims ? sh : 0);
             g_stillSeq.fetch_add(1);
@@ -556,9 +570,9 @@ public:
         g_gapTraceRemaining.store(GAP_TRACE_FRAMES);
         g_stillCV.notify_all();
         if (haveDims) {
-            log_ts("  still trigger -> /still %ld bytes %dx%d, sending F9", len, sw, sh);
+            log_ts("  still trigger -> /still %zu bytes %dx%d, sending F9", frameLen, sw, sh);
         } else {
-            log_ts("  still trigger -> /still %ld bytes (SOF unreadable), sending F9", len);
+            log_ts("  still trigger -> /still %zu bytes (SOF unreadable), sending F9", frameLen);
         }
         // F9 is sent LAST and only on success. The browser learns a capture
         // happened solely because we tell it, so emitting the keystroke after the
@@ -1569,8 +1583,8 @@ static HelperState start_capture() {
     g_cap.pBuilder->SetFiltergraph(g_cap.pGraph);
     g_cap.pGraph->AddFilter(g_cap.pSrc, L"Source");
 
-    // Capture pin at 1600x1200 MJPG: live preview + source of /still snapshot.
-    // Still pin at 320x240 MJPG: hardware-button trigger only; bytes discarded.
+    // Capture pin: live /preview and /snapshot, at the configured preview mode.
+    // Still pin: the bytes /still serves, at the sensor's full resolution.
     configure_format(g_cap.pSrc, g_cap.pBuilder, &PIN_CATEGORY_CAPTURE,
                      g_configuredWidth.load(), g_configuredHeight.load());
     log_compression_caps(g_cap.pSrc, g_cap.pBuilder, &PIN_CATEGORY_CAPTURE);
