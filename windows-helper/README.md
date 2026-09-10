@@ -184,17 +184,21 @@ The resource script is [`helper.rc`](helper.rc). Besides the version block it em
 | Target | Output | Size | Notes |
 |---|---|---|---|
 | `make shared` | `dist/helper.exe` + `libstdc++-6.dll`, `libgcc_s_seh-1.dll`, `libwinpthread-1.dll` | ~870 KB exe + ~2.7 MB DLLs | Ship the whole folder. DLLs are the mingw-w64 C/C++ runtime. Local builds only — never published to a release. |
-| `make static` | `dist-static/helper.exe` | ~3.4 MB single file | No external deps. Drop anywhere and run. Slower to link, larger binary. **This is the build the Releases page ships.** |
+| `make static` | `dist-static/helper.exe` | ~1.4 MB single file | No external deps. Drop anywhere and run. Slower to link. **This is the build the Releases page ships.** The exact size depends on the mingw-w64 runtime that was linked in — a toolchain update has moved it by more than 2 MB before — so verify a download by its SHA256, never by its byte count. |
 
-Both link against **only inbox Windows DLLs** at runtime:
+Both link against **only inbox Windows DLLs** at runtime. In the import table (`objdump -p helper.exe | grep 'DLL Name'`):
 - `KERNEL32.dll`, `USER32.dll` — base Win32
-- `ole32.dll`, `oleaut32.dll` — COM (DirectShow is COM-based)
-- `strmiids` symbols — compile-time only; resolved into the binary
-- `ws2_32.dll` — Winsock 2
-- `quartz.dll` — DirectShow graph manager
-- `qedit.dll` — `CLSID_SampleGrabber`, `CLSID_NullRenderer`
-- `shell32.dll` — the tray icon (`Shell_NotifyIcon`) and **Open test page** (`ShellExecute`)
-- `gdi32.dll` — loaded dynamically at startup only, to build the greyed-out icon variant. If it cannot be loaded the helper simply uses one icon for every state.
+- `msvcrt.dll` — the C runtime mingw-w64 targets
+- `ole32.dll`, `OLEAUT32.dll` — COM (DirectShow is COM-based)
+- `WS2_32.dll` — Winsock 2
+- `SHELL32.dll` — the tray icon (`Shell_NotifyIcon`) and **Open test page** (`ShellExecute`)
+
+Loaded at runtime rather than imported, so they do not appear in that list:
+- `quartz.dll` — DirectShow graph manager, via `CoCreateInstance`
+- `qedit.dll` — `CLSID_SampleGrabber`, `CLSID_NullRenderer`, via `CoCreateInstance`
+- `gdi32.dll` — `LoadLibrary` at startup only, to build the greyed-out icon variant. If it cannot be loaded the helper simply uses one icon for every state.
+
+`strmiids` symbols are compile-time only and resolved into the binary.
 
 All of those are present on every Windows 7/8/10/11 installation. No Visual C++ Redistributable required.
 
