@@ -400,6 +400,8 @@ Browser support is universal. You can also read the same URL with `fetch()` and 
 
 Response headers include `Access-Control-Allow-Origin: *` so the endpoint can be consumed from any origin.
 
+Every viewer receives every published frame: opening the built-in test page beside the clinical app does not reduce the app's frame rate, but each extra viewer is another full-rate stream on the wire (~290 KB per frame at the default 1024×768). On a link that is already the bottleneck, close test pages you are not looking at. `preview_clients` on `/health` shows how many are attached.
+
 Query strings are stripped before routing, so the common cache-busting pattern `/preview?t=${Date.now()}` works as expected — see "Recovering from a Stop/Start cycle" below for why you'd want that. They are *ignored* everywhere except `/still`, which reads `?after=<seq>` out of the query string to long-poll (see below); a cache-buster there is harmless as long as you keep `after=` intact.
 
 ### `GET /still`

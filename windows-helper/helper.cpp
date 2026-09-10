@@ -315,6 +315,13 @@ static std::atomic<long long> g_sessionStartMs{0};
 // that Stop -> Start cycles work: stop_capture() clears it, start_capture()
 // sets it again.
 static std::atomic<bool> g_serverRunning{false};
+// Bumped on every successful http_server_start(). http_server_stop() waits at
+// most 2 s for client threads to unwind, and a /preview thread stuck in send()
+// (bounded by SO_SNDTIMEO, not by shutdown()) can outlive that. Without this a
+// survivor would see g_serverRunning flip back to true on the next Start and
+// resume its loop against a session it never belonged to. Each /preview handler
+// records the generation it joined and exits as soon as that stops matching.
+static std::atomic<unsigned long long> g_serverGeneration{0};
 
 // ---- /health instrumentation (read-only for HTTP handlers) ----
 // configure_format() records the winning Capture-pin MJPG mode here so the
@@ -955,7 +962,15 @@ static void handle_client(SOCKET sock) {
             "Pragma: no-cache\r\n"
             "Access-Control-Allow-Origin: *\r\n"
             "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
-        send_all(sock, hdr, (int)strlen(hdr));
+        // A peer that vanished during the handshake must not fall through into
+        // the streaming loop: it would count as a viewer in /health and burn a
+        // 2 s CV timeout before its first failed frame send got it out.
+        if (!send_all(sock, hdr, (int)strlen(hdr))) {
+            log_ts("Preview client disconnected while sending headers "
+                   "(WSA error %d, %d preview client(s) active).",
+                   WSAGetLastError(), g_previewClients.load());
+            return;
+        }
 
         // RAII counter for /health preview_clients. Increments on entry, and
         // decrements on every exit path from the streaming loop below (return,
@@ -966,17 +981,23 @@ static void handle_client(SOCKET sock) {
             ~PreviewClientGuard() { g_previewClients.fetch_sub(1); }
         } previewClientGuard;
 
+        // The Start this stream belongs to. See g_serverGeneration.
+        const unsigned long long generation = g_serverGeneration.load();
+        auto sessionLive = [&]{
+            return g_serverRunning && g_serverGeneration.load() == generation;
+        };
+
         // Start from the CURRENT sequence number, not -1: with -1 a client that
         // connects before the first frame arrives would immediately pass the
         // predicate and emit an empty Content-Length: 0 part.
         long long lastSeq = g_previewSeq.load();
-        while (g_serverRunning) {
+        while (sessionLive()) {
             std::vector<BYTE> frame;
             {
                 std::unique_lock<std::mutex> lk(g_previewMutex);
                 g_previewCV.wait_for(lk, std::chrono::seconds(2),
-                                    [&]{ return g_previewSeq.load() != lastSeq || !g_serverRunning; });
-                if (!g_serverRunning) break;
+                                    [&]{ return g_previewSeq.load() != lastSeq || !sessionLive(); });
+                if (!sessionLive()) break;
                 if (g_previewSeq.load() == lastSeq) continue;
                 frame = g_latestPreview;
                 lastSeq = g_previewSeq.load();
@@ -990,9 +1011,16 @@ static void handle_client(SOCKET sock) {
             int plen = snprintf(part, sizeof(part),
                 "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n",
                 frame.size());
-            if (!send_all(sock, part, plen)) break;
-            if (!send_all(sock, (const char*)frame.data(), (int)frame.size())) break;
-            if (!send_all(sock, "\r\n", 2)) break;
+            if (!send_all(sock, part, plen) ||
+                !send_all(sock, (const char*)frame.data(), (int)frame.size()) ||
+                !send_all(sock, "\r\n", 2)) {
+                // Normal for a closed tab; the WSA error and the surviving
+                // viewer count are what distinguish that from a link problem.
+                log_ts("Preview client disconnected while sending frame %lld "
+                       "(WSA error %d, %d preview client(s) active).",
+                       lastSeq, WSAGetLastError(), g_previewClients.load() - 1);
+                break;
+            }
         }
         return;
     }
@@ -1311,6 +1339,7 @@ static bool http_server_start(int port) {
         return false;
     }
     g_listenSock = srv;
+    g_serverGeneration.fetch_add(1);
     g_serverRunning = true;
     g_sessionStartMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
