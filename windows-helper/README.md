@@ -656,6 +656,8 @@ Presses spaced 4–6 s apart were accepted every time — 11 of the 12 logged pr
 
 The device can silently drop its Still pin to the capture pin's resolution — 1600×1200 down to 1024×768 — partway through a session, **while continuing to advertise the negotiated 1600×1200 format**. The media type therefore cannot be trusted; only the decoded pixels can. The state is sticky: every subsequent press delivers a degraded frame until capture is restarted.
 
+Note the Still pin's own mode list is `1600x1200, 1280x1024, 1280x960, 800x600, 640x480, 352x288, 320x240` — **1024×768 is not on it**. So this is not the pin renegotiating to a lower still mode, because that mode does not exist for it; the pin is delivering *capture-pin* frames. That is why the advertised media type stays truthful at 1600×1200: the pin's negotiated format really is unchanged, it is simply handing over another pin's buffers. Hence a pixel-level check is the only thing that can catch it.
+
 Serving such a frame would hand a clinician a preview-grade image labelled as a full-sensor still, which is worse than no image because the degradation is invisible in the UI. So `StillCB::BufferCB` compares each decoded frame against `still_pin_width`/`_height` and refuses a mismatch: `/still` and `still_seq` are left untouched and **no F9 is sent**, exactly as for an unusable buffer.
 
 ```
