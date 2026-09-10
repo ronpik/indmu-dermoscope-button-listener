@@ -64,3 +64,11 @@ jobs:
           set -euo pipefail
           make static
           ls -la dist-static/
+
+      # Nothing else builds tools/, so without this it would quietly rot until
+      # the next time someone needs it -- which is always mid-incident.
+      - name: Build debugging tools (make camprobe)
+        working-directory: windows-helper
+        run: |
+          set -euo pipefail
+          make camprobe
