@@ -115,6 +115,14 @@ jobs:
           echo "Building version: $version"
           echo "VERSION=$version" >> "$GITHUB_ENV"
 
+      # Ahead of the build so a parser regression fails the release before any
+      # artifact exists to attach.
+      - name: Unit tests (make test)
+        working-directory: windows-helper
+        run: |
+          set -euo pipefail
+          make test
+
       - name: Build (make static)
         working-directory: windows-helper
         run: |

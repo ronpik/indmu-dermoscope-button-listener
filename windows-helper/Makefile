@@ -5,6 +5,7 @@
 #   make shared   -> dist/helper.exe + runtime DLLs in dist/ (small exe, 3 DLLs alongside)
 #   make static   -> dist-static/helper.exe  (single fat exe, no external DLLs)
 #   make all      -> both of the above (default)
+#   make test     -> build and run the unit tests (see the test target below)
 #   make clean    -> remove both dist dirs, dist-installer/ and build/
 #
 # Installer (per-user, no admin required):
@@ -109,7 +110,7 @@ ISCC_DEFAULT := C:/Program Files (x86)/Inno Setup 6/ISCC.exe
 ISCC         ?= $(if $(shell command -v iscc 2>/dev/null),iscc,$(ISCC_DEFAULT))
 ISS          := installer/helper.iss
 
-.PHONY: all shared static installer clean check-toolchain check-iscc FORCE
+.PHONY: all shared static installer test clean check-toolchain check-iscc FORCE
 
 all: shared static
 
@@ -174,6 +175,20 @@ $(DIST_STATIC)/helper.exe: $(SRC) $(RES_OBJ) | $(DIST_STATIC)
 
 $(DIST_STATIC):
 	mkdir -p $(DIST_STATIC)
+
+# --- Unit tests ---
+# Only the header-only, windows.h-free parsers in mjpeg_frame.h are covered.
+# helper.cpp itself is a single-file GUI app whose logic is bound to DirectShow
+# and Winsock, so anything worth unit testing gets split out into a header first
+# and tested here.
+TEST_SRC := test_mjpeg_frame.cpp
+TEST_BIN := $(BUILD_DIR)/test_mjpeg_frame.exe
+
+test: check-toolchain $(TEST_BIN)
+	@./$(TEST_BIN)
+
+$(TEST_BIN): $(TEST_SRC) mjpeg_frame.h | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -o $@ $(TEST_SRC)
 
 # --- Installer: per-user Inno Setup package wrapping the static exe ---
 # helper.iss lives in installer/ and its own OutputDir is "..\dist-installer"

@@ -1,0 +1,66 @@
+# CI
+#
+# Runs the windows-helper unit tests (`make test`) and confirms the exe still
+# builds, on every push and pull request that touches windows-helper/. The
+# release workflow runs `make test` too, but only when a release is published --
+# which is far too late to learn that a parser regression shipped. This is the
+# gate that runs while the change is still a diff.
+#
+# Deliberately does NOT build the installer: ISCC is a separate dependency and
+# the release workflow already covers that path.
+
+name: CI
+
+on:
+  push:
+    paths:
+      - 'windows-helper/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    paths:
+      - 'windows-helper/**'
+      - '.github/workflows/ci.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  windows-helper:
+    name: windows-helper tests
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    # Same rule as release.yml: run steps must come after "Set up MSYS2", since
+    # this shell does not exist until that action has run.
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up MSYS2 (MINGW64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-binutils
+            make
+
+      - name: Unit tests (make test)
+        working-directory: windows-helper
+        run: |
+          set -euo pipefail
+          make test
+
+      # A green test suite with a broken build is not a useful signal: the
+      # tests only cover the headers split out of helper.cpp, so compiling the
+      # real thing is what catches a mistake in the other ~2000 lines.
+      - name: Build (make static)
+        working-directory: windows-helper
+        run: |
+          set -euo pipefail
+          make static
+          ls -la dist-static/
