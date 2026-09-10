@@ -115,7 +115,7 @@ static int g_port = 8080;
 // the sensor's full 1600x1200 and gets the same ~6.8 fps, because the helper is
 // never the bottleneck. helper-config.txt next to the exe sets it; --preview=WxH
 // overrides that. Read once at startup -- changing it rebuilds the DirectShow
-// graph, so unlike the note file it cannot be reloaded per request.
+// graph, so it cannot be reloaded per request.
 static std::atomic<int> g_configuredWidth{1024};
 static std::atomic<int> g_configuredHeight{768};
 
@@ -135,8 +135,7 @@ static std::atomic<int> g_stillPinHeight{0};
 // that has reset to 0; a changed run_id tells it to drop the stored value.
 static long long g_runId = 0;
 
-// Builds a path to a file sitting next to the exe. Kept separate from the note
-// file's own copy of this logic, which is scaffolding and gets removed.
+// Builds a path to a file sitting next to the exe.
 static bool exe_dir_path(const wchar_t *leaf, wchar_t *out, size_t outLen) {
     wchar_t dir[MAX_PATH] = {0};
     DWORD n = GetModuleFileNameW(NULL, dir, MAX_PATH);
@@ -758,40 +757,6 @@ static void log_compression_caps(IBaseFilter *pSrc, ICaptureGraphBuilder2 *pBuil
     pComp->Release();
 }
 
-// SCAFFOLDING -- NOT FOR RELEASE. Cross-session coordination channel for the
-// preview-perf experiments: the helper is the only surface both the Windows
-// (helper) and Mac (web app) sides can see, and the Mac polls /health every
-// 2 s. Reading the note at request time rather than at startup means a message
-// can be changed by editing the file, with no rebuild and no stream drop.
-// Drop this commit before opening the PR.
-static std::string read_note_file() {
-    wchar_t dir[MAX_PATH] = {0};
-    DWORD n = GetModuleFileNameW(NULL, dir, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) return std::string();
-    wchar_t *slash = wcsrchr(dir, L'\\');
-    if (!slash) return std::string();
-    slash[1] = 0;
-    if (wcslen(dir) + 20 >= MAX_PATH) return std::string();
-
-    wchar_t path[MAX_PATH];
-    wcscpy(path, dir);
-    wcscat(path, L"helper-note.txt");
-    FILE *fp = _wfopen(path, L"rb");
-    if (!fp) return std::string();
-
-    // Cap the body: /health is polled every 2 s and must stay cheap.
-    static const size_t NOTE_MAX = 8192;
-    std::string out;
-    char buf[1024];
-    size_t got;
-    while (out.size() < NOTE_MAX && (got = fread(buf, 1, sizeof(buf), fp)) > 0) {
-        out.append(buf, got);
-    }
-    fclose(fp);
-    if (out.size() > NOTE_MAX) out.resize(NOTE_MAX);
-    return out;
-}
-
 // ---- HTTP server ----
 static const char INDEX_HTML[] =
 "<!DOCTYPE html>\n"
@@ -1210,8 +1175,7 @@ static void handle_client(SOCKET sock) {
         // restart must drop it when this changes, or ?after= waits forever.
         body += ",\"run_id\":" + std::to_string(g_runId);
         body += ",\"port\":" + std::to_string(g_port);
-        body += ",\"uptime_s\":" + std::to_string(uptimeS);
-        body += ",\"note\":\"" + json_escape(read_note_file()) + "\"}";
+        body += ",\"uptime_s\":" + std::to_string(uptimeS) + "}";
 
         char hdr[256];
         int hlen = snprintf(hdr, sizeof(hdr),
