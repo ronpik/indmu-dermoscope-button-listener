@@ -43,8 +43,8 @@ The shared build (`make shared` → `dist/helper.exe`, ~870 KB) needs three ming
 2. Click through the wizard — no admin prompt appears. The two checkboxes it shows are already set sensibly for a clinic workstation: **desktop shortcut** is off, **"Start Dermoscope Helper when I sign in"** is on. The client can change either before clicking Install.
 3. At the end of setup, "Launch Dermoscope Helper" is checked by default — leave it, and the helper starts right there. An icon appears in the system tray (notification area), capture starts on its own, and a balloon reports the result.
    - **Windows 11 hides new tray icons by default.** The first time, look in the overflow flyout behind the `^` chevron on the taskbar. Drag the icon onto the taskbar to pin it.
-4. Open `http://localhost:8080/` in a browser — the built-in test page shows live preview. (Right-click the tray icon → **Open test page** does the same thing.) Press the hardware button on the dermoscope → full-res capture appears in the canvas on the right. That's the smoke test.
-5. If it works, point the production web app at `http://localhost:8080/preview` and `http://localhost:8080/still`.
+4. Open `http://localhost:8080/` in a browser — the built-in test page shows live preview. (Right-click the tray icon → **Open test page** does the same thing.) Press the hardware button on the dermoscope → the full-resolution capture appears in the canvas on the right. That's the smoke test. **The live preview freezes for about 2 seconds after each press** — that is the device producing the still, not a fault; see "Caveats".
+5. If it works, point the production web app at `http://localhost:8080/preview` and `http://localhost:8080/still` (plus `/snapshot` if it has an on-screen capture button — see below).
 6. When finished, right-click the tray icon → **Exit**. That is how you quit the helper and release the camera for other apps — there is no window to close. Because "start at sign-in" is on by default, it'll be back in the tray next time the client logs in, with no need to launch it by hand.
 
 Right-clicking the tray icon gives four commands: **Start**, **Stop**, **Open test page**, **Exit**. Left double-click toggles Start / Stop. Hover the icon for a tooltip showing the current state (`running`, `stopped`, `device not found`, `camera busy`, `error`).
@@ -62,11 +62,13 @@ No admin rights, no driver install. The server listens on all network interfaces
 - **Close any other app that might be using the camera** before running — Teams, Zoom, Skype, Windows Camera app, another browser tab doing `getUserMedia`. The dermoscope is a **single-consumer** USB device; if anything else holds it open, the helper fails to start (`MediaControl::Run` returns `ERROR_NO_SYSTEM_RESOURCES`). Log will say so.
 - **The browser tab must be focused** when the user presses the hardware button. `SendInput` only delivers the F9 keystroke to the foreground window — if the clinician clicks off to Outlook and then presses the button, F9 goes to Outlook, not the web app.
 - **Mixed-content rules.** If the production web app is served over HTTPS, modern browsers treat `http://localhost` as a **secure context**, so `<img src="http://localhost:8080/preview">` and `fetch("http://localhost:8080/still")` work from an HTTPS page. Verify on the target browser before shipping — behavior is uniform on current Chrome/Edge/Firefox/Safari, but test anyway.
+- **A capture freezes the preview for roughly 2 seconds.** While the device produces a still its firmware stops delivering preview frames, so `/preview` (and `/snapshot`, which serves preview frames) stalls. Measured across 11 accepted presses the stall ran **1696–2049 ms**, clustering near 2.0 s. Budget for ~2 s and treat anything under 2.1 s as normal rather than picking a tighter number. Recovery is immediate — the next frame is already back at the nominal interval, with no gradual ramp — and the captured image is ready at the *start* of that window, so an app that renders the capture straight away hides the freeze entirely. This is the device, not the helper, and it is the price of full-resolution device stills.
+- **A press during that window is silently swallowed.** Press again before the cooldown ends and the firmware discards it: no image, no F9, and no log line for the press — the only trace is the next stall running long (4145 ms instead of ~2000 in the one instance observed, 1 press in 12). The helper cannot work around it: the arrival of the still *is* the trigger, and there is no arrival to react to. **Fix it in the UI:** disable the capture affordance for ~2 s after each press, which turns an impossible input into one that simply isn't accepted. Presses spaced 4–6 s apart were accepted every time.
 - **Single button gesture.** One press = one capture. Multi-click (double / triple) is **not** supported on this hardware — see the post-mortem at [`../docs/NEXT-SESSION.md`](../docs/NEXT-SESSION.md) for the details. Any "clear / undo / re-take / navigate" gestures should live in the web-app UI (buttons or keyboard shortcuts), not on the hardware button.
 
 ---
 
-## What the web-app team needs to add (three touches)
+## What the web-app team needs to add (three touches, plus one optional)
 
 ### 1. Preview source
 
@@ -74,23 +76,47 @@ No admin rights, no driver install. The server listens on all network interfaces
 <img id="preview" src="http://localhost:8080/preview">
 ```
 
-Native resolution is 1600×1200. Apply CSS for display size. No `getUserMedia` needed — the helper owns the camera and streams MJPEG to this tag.
+Default resolution is **1024×768** at ~6.8 fps; apply CSS for display size. No `getUserMedia` needed — the helper owns the camera and streams MJPEG to this tag.
+
+The preview is deliberately *not* the camera's top mode. Over Wi-Fi the link is the bottleneck and client frame rate is set by bytes per frame, so 1600×1200 delivers ~2.4 fps to a remote browser where 1024×768 delivers ~6.1. On a wired workstation that constraint disappears and the full 1600×1200 is a one-line config change — see [Changing the resolutions](#changing-the-resolutions) below. **This affects the preview only; `/still` is full-resolution regardless.**
 
 ### 2. Capture on F9
 
 ```js
+let seq = 0;   // last still we've seen; reset to 0 whenever /health's run_id changes
+
 document.addEventListener('keydown', async e => {
   if (e.key !== 'F9' && e.code !== 'F9') return;
   e.preventDefault();
-  const resp = await fetch('http://localhost:8080/still', { cache: 'no-store' });
-  if (resp.status === 204) return;   // nothing captured yet this session -- not an error
+  const resp = await fetch(`http://localhost:8080/still?after=${seq}`, { cache: 'no-store' });
+  if (resp.status === 204) return;   // no new still within 8 s -- see below
   if (!resp.ok) return;
+  seq = Number(resp.headers.get('X-Still-Seq'));
   const blob = await resp.blob();
-  // render or upload the blob -- it's a ~1600x1200 JPEG
+  // render or upload the blob -- a 1600x1200 JPEG straight from the device
 });
 ```
 
+**These are the device's own stills**, from the camera's Still pin at 1600×1200 — not a frozen preview frame, and not affected by the preview resolution. That separation is the point: the preview runs low for streaming smoothness, `/still` stays full-resolution for diagnostic quality.
+
 `/still` returns **`204 No Content`** (not `404`) before the first button press of a session — that's a normal "nothing captured yet" state, so don't treat it as "helper not connected".
+
+**`?after=<seq>` and `X-Still-Seq` are a safety net, not the mechanism.** The helper stores the bytes and bumps the sequence number *before* it sends F9, so by the time your handler runs the new image is already there and this returns immediately. `?after=` blocks up to 8 s and then returns `204`; if you ever see it actually block, the keystroke was lost — usually the browser wasn't focused — and this is how you collect the capture anyway. Worth logging when it happens.
+
+**Don't strip `X-Still-Seq` through a proxy.** The helper sends `Access-Control-Expose-Headers: X-Still-Seq` alongside it; without that header a cross-origin `fetch` cannot read the sequence number at all, and `headers.get()` returns `null` with no error explaining why.
+
+**Not every press produces an F9.** If the device delivers an unusable buffer, the helper keeps the previous image and sends **no keystroke** — so a failed capture looks like "the button did nothing" rather than silently re-saving the previous lesion. Don't build logic that assumes press ⇒ F9.
+
+### 2b. Optional: on-screen capture button → `GET /snapshot`
+
+If the UI has its own Capture button, it must use `/snapshot`, not `/still` — `/still` only changes on a physical press.
+
+```js
+const resp = await fetch('http://localhost:8080/snapshot', { cache: 'no-store' });
+if (resp.ok) { /* JPEG blob of the latest preview frame */ }
+```
+
+`/snapshot` returns the latest preview frame, never blocks, needs no button press, and costs the device nothing extra. It serves at the **preview** resolution (1024×768 by default, ~274 KB), so a software capture cannot match a hardware one — the device only produces full-resolution stills on a physical press. Make sure the UI doesn't imply otherwise. Returns `204` only if no preview frame has arrived yet.
 
 ### 3. Connectivity check: `GET /health`
 
@@ -107,11 +133,47 @@ async function helperIsUp() {
 }
 ```
 
-See [`README.md`](README.md#get-health) for the full response shape (version, device name, frame counters, `still_available`, `uptime_s`).
+`/health` also reports **`run_id`**, which changes on every helper restart. **A client holding a `still_seq` across a restart must drop it when `run_id` changes** — the counter resets to 0, so a stale `?after=` would otherwise wait forever.
+
+See [`README.md`](README.md#get-health) for the full response shape (version, device name, requested and negotiated resolutions, frame counters and measured fps, `still_available`, `uptime_s`).
 
 ---
 
-All three endpoints send `Access-Control-Allow-Origin: *`, so cross-origin from any web app on any origin is allowed.
+All four endpoints (`/preview`, `/still`, `/snapshot`, `/health`) send `Access-Control-Allow-Origin: *`, so cross-origin from any web app on any origin is allowed, and `OPTIONS` preflight is answered on all of them.
+
+---
+
+## Changing the resolutions
+
+Both resolutions are settings rather than constants, so a site that doesn't match the defaults does not need a new build. **The installer does not create a config file** — make one by hand at `%LOCALAPPDATA%\Programs\Dermoscope Helper\helper-config.txt`, next to `helper.exe` and `helper.log`:
+
+```
+# Dermoscope helper settings
+preview_resolution = 1024x768
+still_resolution   = 1600x1200
+```
+
+One `key = value` per line; `#` and `;` start a comment. **A missing file, an unknown key, or an unparseable value all leave the defaults in place**, so a workstation that has never heard of this file keeps working.
+
+| Key | Default | What it sets |
+|---|---|---|
+| `preview_resolution` | `1024x768` | The live `/preview` stream and `/snapshot`. |
+| `still_resolution` | `1600x1200` | The image `/still` serves on a button press. |
+
+Both are read **once at startup** — changing either rebuilds the camera graph, so it can't be hot-reloaded. Edit the file and restart the helper from the tray icon.
+
+**The usual reason to touch this is a wired workstation.** The 1024×768 preview default exists to fit a Wi-Fi link; on a cable, set `preview_resolution = 1600x1200` and the preview runs at full resolution at the same ~6.8 fps. Leave `still_resolution` alone — captures are already full-resolution.
+
+**Check what the camera actually accepted.** The camera offers a fixed list of modes and silently falls back to the nearest one rather than failing, so a typo doesn't announce itself. `GET /health` reports the requested and negotiated modes side by side:
+
+```
+preview_resolution = 999x999   ->   "configured_width": 999,  "capture_width": 1280
+                                    "configured_height": 999, "capture_height": 1024
+```
+
+If `configured_*` and `capture_*` disagree, that mode doesn't exist on that camera. `still_pin_width` / `still_pin_height` report the same thing for the Still pin — note the Still pin's list does **not** include 1024×768, so asking for it there lands on a neighbouring mode.
+
+Full details in [`README.md`](README.md#configuration-file-helper-configtxt).
 
 ---
 
@@ -162,15 +224,25 @@ Expected log on a good run — on stderr with `--console`, otherwise in `helper.
 [HH:MM:SS.mmm] Config: port=8080 debounce_ms=300 mode=console
 [HH:MM:SS.mmm] Looking for dermoscope (vid_ab02)...
 [HH:MM:SS.mmm] Selected device: USB Camera
-[HH:MM:SS.mmm] Setting format MJPG 1600x1200 on pin
-[HH:MM:SS.mmm] Setting format MJPG 320x240 on pin
+[HH:MM:SS.mmm] Setting format MJPG 1024x768 on pin (AvgTimePerFrame=666666 100ns)
+[HH:MM:SS.mmm] Setting format MJPG 1600x1200 on pin (AvgTimePerFrame=10000000 100ns)
 [HH:MM:SS.mmm] MediaControl::Run HR=0x00000001
 [HH:MM:SS.mmm] Graph state: 2 (2=Running)
 [HH:MM:SS.mmm] HTTP server listening on http://localhost:8080/
 [HH:MM:SS.mmm] Helper ready. Open http://localhost:8080/ in your browser.
 [HH:MM:SS.mmm] Hardware button -> F9 -> web app fetches /still.
 # ... on button press:
-[HH:MM:SS.mmm]   still trigger -> /still 413392 bytes, sending F9
+[HH:MM:SS.mmm]   still trigger -> /still 728592 bytes 1600x1200, sending F9
+[HH:MM:SS.mmm]   post-still preview frame 1: gap 1983 ms, t+1903 ms
+[HH:MM:SS.mmm]   post-still preview frame 2: gap 128 ms, t+2031 ms
 ```
+
+Two `Setting format` lines are expected, and their order matters: the **first** is the Capture pin (the preview, 1024×768 by default) and the **second** is the Still pin (1600×1200). If either shows a resolution you didn't ask for, the camera doesn't offer that mode and silently picked the nearest one — `/health` reports the requested and negotiated values side by side so you can see it.
+
+The `AvgTimePerFrame` figures are the driver's claims and **neither is delivered**: 666666 means 15 fps on the Capture pin, which actually produces ~6.8 fps at every resolution it offers. Don't design around the advertised numbers; `/health`'s `preview_input_fps` reports the measured one.
+
+The `post-still preview frame` lines are the capture freeze being measured, and are normal. The first line's `gap` is the length of the stall; by the second, frame timing is already back to nominal (~128–147 ms). Forty of these are logged after each press.
+
+A press whose still the device fails to deliver logs `still trigger -> device delivered N unusable bytes; /still unchanged, NO F9 sent` — the capture failed, the previous image is untouched, and no keystroke went to the browser. A press swallowed during the cooldown logs **nothing at all**.
 
 If `MediaControl::Run` returns anything other than `0x00000000` or `0x00000001`, or if `Graph state` is not `2`, something else is holding the camera — close Teams / Zoom / browser cam tabs / other helper instances and retry. In tray mode the same condition shows up as a `camera busy` tooltip and balloon.

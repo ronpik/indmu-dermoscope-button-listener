@@ -609,14 +609,16 @@ Only one app can stream from the dermoscope at a time on Windows. If anything el
 
 While the device produces a still, its firmware stops delivering frames on the capture pin, so the live preview freezes. This is the device's behaviour, not a helper stall, and it is the price of real full-resolution device stills.
 
-Measured on the HT-B30S with the Still pin at 1600×1200, across four clean presses:
+Measured on the HT-B30S with the Still pin at 1600×1200, across 11 accepted presses in three sessions:
 
 | | |
 |---|---|
-| Freeze after a press | **1904 ms** (1903 / 1905 / 1904 / 1903 — a 2 ms spread) |
+| Freeze after a press | **1696–2049 ms**, clustering near 2.0 s |
 | Recovery once it ends | **immediate** — the next frame is already at the nominal interval |
 
-There is no gradual ramp: frame 1 after the still shows the ~2 s gap, frame 2 is back to ~144 ms (nominal is 147 ms at 6.8 fps), so a "recovering" UI state isn't warranted. `preview_max_gap_ms_since_still` on `/health` reports this per capture.
+Budget for ~2 s rather than a tighter figure: a single run can look far more consistent than the device is. Four consecutive presses in one session landed within 2 ms of each other (1903 / 1905 / 1904 / 1903), but across sessions the same measurement spans ~350 ms, so that tightness is not something to design against.
+
+There is no gradual ramp: frame 1 after the still shows the ~2 s gap, frame 2 is back to ~128–147 ms (nominal is 147 ms at 6.8 fps), so a "recovering" UI state isn't warranted. `preview_max_gap_ms_since_still` on `/health` reports this per capture.
 
 The image itself is ready at the **start** of that window — the bytes are stored and `still_seq` is bumped before the F9 keystroke is sent — so an app that renders the captured still immediately hides the freeze entirely.
 
@@ -624,11 +626,11 @@ Note this affects `/snapshot` too, since it serves preview frames: for ~2 s afte
 
 ### A press during the cooldown is silently swallowed
 
-If the button is pressed while the device is still in that ~2 s window, the firmware discards it: `StillCB::BufferCB` is never called, so there is **no still, no `still_seq` increment and no F9**, and the freeze extends by roughly one more cooldown period. This was observed once in five presses during the measurement above (a 4000 ms freeze instead of 1904 ms).
+If the button is pressed while the device is still in that ~2 s window, the firmware discards it: `StillCB::BufferCB` is never called, so there is **no still, no `still_seq` increment and no F9**, and the freeze extends by roughly one more cooldown period. Observed once in 12 logged presses — a 4145 ms stall instead of the usual ~2000 ms. Note the press leaves no log line of its own, so a long stall is the only evidence it happened.
 
 It is a device limitation, not something the helper can work around — the arrival of a Still-pin sample *is* the trigger, and there is no sample to react to. The practical fix is in the UI: disable the capture affordance for ~2 s after each press, which turns an impossible input into one that simply isn't accepted. A `?after=` long-poll timing out at 8 s is the other signal for the same condition.
 
-Presses spaced 4–6 s apart were accepted 5 out of 5.
+Presses spaced 4–6 s apart were accepted every time — 11 of the 12 logged presses, with the single rejection being the one deliberately made inside the cooldown.
 
 ---
 
